@@ -69,17 +69,62 @@ module Rubycog
     end
   end
 
-  # Block-level Markdown for the transcript: fenced code blocks are marked as
-  # code (so the caller can color and indent them), headings lose their hashes
-  # and are marked for emphasis, and everything else is shown as typed. Inline
-  # syntax is deliberately not parsed.
+  # Markdown for the transcript. Fenced code blocks are marked as code (so the
+  # caller can colour and indent them), headings lose their hashes and are
+  # marked for emphasis, and inline `code`, **bold** and *italic* become styled
+  # segments instead of literal markers. Every line comes back as a Row, so a
+  # single line can mix styles.
   module Markdown
     module_function
 
     FENCE = '```'
     HEADING = /\A\#{1,6}\s+/
+    # Inline spans, tried left to right: `code`, **bold**, *italic*. A marker
+    # only counts when non-space text follows and precedes it, so "2 * 3 * 4"
+    # stays literal. Underscore emphasis is deliberately unsupported: it would
+    # mangle snake_case identifiers in a coding transcript.
+    INLINE = /`([^`\n]+)`|\*\*(?=\S)(.+?)(?<=\S)\*\*|\*(?=\S)(.+?)(?<=\S)\*/
 
-    # Turns text into [line, style] pairs, style being :code, :heading, or nil.
+    # One wrapped display row: [text, style] segments that together fit the
+    # requested width. Styles are nil for prose, otherwise :code, :heading,
+    # :bold, :italic or :inline_code; the UI maps them to colours and
+    # attributes.
+    class Row
+      attr_reader :segments
+
+      def initialize(segments = [])
+        @segments = segments
+        @width = segments.sum { |text, _style| Text.width(text) }
+      end
+
+      # Appends text in one style, merging into the previous segment when the
+      # style matches so a row stays a short list of runs.
+      def concat(text, style = nil)
+        return self if text.nil? || text.empty?
+
+        last = @segments.last
+        if last && last[1] == style
+          last[0] << text
+        else
+          @segments << [+text, style]
+        end
+        @width += Text.width(text)
+        self
+      end
+
+      # Returns a copy with `prefix` in front, used for the transcript indent.
+      def indented(prefix, style = nil)
+        Row.new([[+prefix, style], *@segments])
+      end
+
+      # Plain text of the row without styling: used by tests and by search.
+      def text = @segments.map(&:first).join
+
+      def width = @width
+      def empty? = @width.zero?
+    end
+
+    # Turns text into rows, one per display line.
     def lines(text, width)
       rows = []
       fenced = false
@@ -99,14 +144,54 @@ module Rubycog
     end
 
     def plain_lines(line, width)
-      return Text.wrap(line, width).map { |row| [row, nil] } unless line.match?(HEADING)
-
-      Text.wrap(line.sub(HEADING, ''), width).map { |row| [row, :heading] }
+      heading = line.match?(HEADING)
+      fill(inline_chars(heading ? line.sub(HEADING, '') : line, heading ? :heading : nil), width)
     end
 
     # Two extra spaces keep code visibly apart from prose, so wrap inside them.
     def code_rows(line, width)
-      Text.wrap(line, [width - 2, 1].max).map { |row| ["  #{row}", :code] }
+      inner = [width - 2, 1].max
+      fill(line.each_char.map { |char| [char, :code] }, inner).map { |row| row.indented('  ', :code) }
+    end
+
+    # Splits a line into [char, style] pairs with the inline markers removed.
+    def inline_chars(line, base = nil)
+      chars = []
+      source = line.to_s
+      pos = 0
+      while (match = INLINE.match(source, pos))
+        add_chars(chars, source[pos...match.begin(0)], base)
+        style, content = inline_span(match)
+        add_chars(chars, content, style)
+        pos = match.end(0)
+      end
+      add_chars(chars, source[pos..], base)
+      chars
+    end
+
+    # Which inline style a match carries, and the text inside its markers.
+    def inline_span(match)
+      return [:inline_code, match[1]] if match[1]
+      return [:bold, match[2]] if match[2]
+
+      [:italic, match[3]]
+    end
+
+    def add_chars(chars, text, style)
+      text.to_s.each_char { |char| chars << [char, style] }
+    end
+
+    # Wraps [char, style] pairs into rows, breaking exactly where Text.wrap
+    # does so styling never moves the line breaks.
+    def fill(chars, width)
+      return [Row.new] if width < 1
+
+      rows = [Row.new]
+      chars.each do |char, style|
+        rows << Row.new if !rows.last.empty? && Text.width(char) > width - rows.last.width
+        rows.last.concat(char, style)
+      end
+      rows
     end
   end
 end

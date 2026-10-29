@@ -1,22 +1,28 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
+require 'minitest/mock'
 require 'tmpdir'
 
 class FakeWindow
-  attr_reader :rows, :cursor
+  attr_reader :rows, :cursor, :masks
 
   def initialize(height, width)
     @rows = Array.new(height) { +'' }
+    @masks = Array.new(height) { 0 }
     @width = width
     @cursor = [0, 0]
+    @mask = 0
   end
 
   def maxy = @rows.length
   def maxx = @width
 
-  def attron(*)
+  def attron(mask = 0)
+    @mask = mask
     yield
+  ensure
+    @mask = 0
   end
 
   def setpos(y, x)
@@ -26,6 +32,7 @@ class FakeWindow
   def addstr(text)
     y, x = @cursor
     @rows[y] = @rows[y].ljust(x) + text
+    @masks[y] |= @mask
     @cursor = [y, x + text.length]
   end
 end
@@ -332,6 +339,25 @@ end
     assert_operator narrow.length, :>, wide.length
   end
 
+  def test_entry_rows_are_reused_until_the_text_changes
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entry = { role: :assistant, text: +'hello' }
+    first = tui.send(:entry_rows, entry, 60)
+    assert_same first, tui.send(:entry_rows, entry, 60)
+
+    entry[:text] << ' again'
+    refute_same first, tui.send(:entry_rows, entry, 60)
+  end
+
+  def test_entry_rows_wrap_the_body_between_a_label_and_a_spacer
+    tui = Rubycog::TUI.new(FakeChat.new)
+    rows = tui.send(:entry_rows, { role: :assistant, text: 'hi' }, 60)
+
+    assert_equal 'RubyCog', rows.first.first.text
+    assert_equal '  hi', rows[1].first.text
+    assert rows.last.first.empty?
+  end
+
   def test_drain_events_reports_how_many_events_were_handled
     tui = Rubycog::TUI.new(FakeChat.new)
     assert_equal 0, tui.send(:drain_events)
@@ -468,5 +494,279 @@ end
     assert_includes Rubycog::ToolPreview.for(edit), 'fix'
     assert_includes Rubycog::ToolPreview.for(tests), 'test/agent_test.rb'
     assert_includes Rubycog::ToolPreview.for(docs), 'approval session'
+  end
+
+  # A TUI whose transcript is far taller than the 12-row fake window (7 body
+  # rows), with entries numbered so the visible slice is easy to assert on.
+  def scrolling_tui(count = 30)
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entries = tui.instance_variable_get(:@entries)
+    count.times { |i| entries << { role: :info, text: "line #{i}" } }
+    window = FakeWindow.new(12, 60)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_transcript, 12, 60)
+    [tui, window]
+  end
+
+  # FakeWindow#addstr appends to the existing row, so clear it before redrawing.
+  def redraw_transcript(tui, window, height = 12, width = 60)
+    window.rows.map! { +'' }
+    tui.send(:draw_transcript, height, width)
+    window.rows.join("\n")
+  end
+
+  def test_page_up_scrolls_back_through_history
+    tui, window = scrolling_tui
+    assert_includes redraw_transcript(tui, window), 'line 29'
+
+    20.times do
+      tui.send(:handle_key, Curses::KEY_PPAGE)
+      redraw_transcript(tui, window)
+    end
+    drawn = redraw_transcript(tui, window)
+
+    assert_includes drawn, 'line 0'
+    refute_includes drawn, 'line 29'
+  end
+
+  def test_scrolled_view_stays_put_while_output_streams_in
+    tui, window = scrolling_tui
+    tui.send(:handle_key, Curses::KEY_PPAGE)
+    before = redraw_transcript(tui, window)
+
+    tui.instance_variable_get(:@entries) << { role: :info, text: 'fresh output' }
+    assert_equal before, redraw_transcript(tui, window)
+  end
+
+  def test_scrolling_down_past_the_end_follows_the_tail_again
+    tui, window = scrolling_tui
+    tui.send(:handle_key, Curses::KEY_PPAGE)
+    redraw_transcript(tui, window)
+    refute_nil tui.instance_variable_get(:@top)
+
+    tui.send(:handle_key, Curses::KEY_NPAGE)
+    assert_nil tui.instance_variable_get(:@top)
+    assert_includes redraw_transcript(tui, window), 'line 29'
+  end
+
+  def test_scrolling_works_while_a_turn_is_running
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    tui.instance_variable_set(:@busy, true)
+
+    tui.send(:handle_key, Curses::KEY_UP)
+    refute_nil tui.instance_variable_get(:@top)
+
+    tui.send(:handle_key, tui.send(:normalize_key, 'a'))
+    assert_equal '', tui.instance_variable_get(:@input)
+  end
+
+  def test_empty_enter_returns_to_the_newest_output
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    tui.send(:handle_key, Curses::KEY_PPAGE)
+    refute_nil tui.instance_variable_get(:@top)
+
+    tui.send(:handle_key, 10)
+    assert_nil tui.instance_variable_get(:@top)
+  end
+
+  def test_footer_reports_a_scrolled_back_transcript
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    tui.send(:handle_key, Curses::KEY_PPAGE)
+    redraw_transcript(tui, window)
+    window.rows.map! { +'' }
+    tui.send(:draw_footer, 12, 60)
+
+    assert_includes window.rows[9], 'scrolled back'
+    assert_includes window.rows[9], 'Enter returns to the end'
+  end
+
+  def test_draws_inline_markdown_with_its_own_attributes
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_get(:@entries) << { role: :assistant, text: "plain **bold**\n`code` *soft*" }
+    window = FakeWindow.new(20, 60)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_transcript, 20, 60)
+
+    bold_row = window.rows.index { |row| row.include?('plain bold') }
+    code_row = window.rows.index { |row| row.include?('code soft') }
+    refute_includes window.rows[bold_row], '*'
+    refute_includes window.rows[code_row], '`'
+    assert_equal Curses::A_BOLD, window.masks[bold_row] & Curses::A_BOLD
+    assert_equal 0, window.masks[bold_row] & Curses.color_pair(Rubycog::TUI::CODE_COLOR)
+    assert_equal Curses.color_pair(Rubycog::TUI::CODE_COLOR),
+      window.masks[code_row] & Curses.color_pair(Rubycog::TUI::CODE_COLOR)
+    assert_equal Curses::A_UNDERLINE, window.masks[code_row] & Curses::A_UNDERLINE
+  end
+
+  # Types text the way curses delivers it: one byte per handle_key call.
+  def type_text(tui, text)
+    text.each_byte { |byte| tui.send(:handle_key, byte) }
+  end
+
+  def test_ctrl_f_finds_the_nearest_match_above_the_viewport
+    tui, window = scrolling_tui
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'line 2')
+
+    assert_equal 'line 2', tui.instance_variable_get(:@search)
+    assert_includes redraw_transcript(tui, window), 'line 29'
+  end
+
+  def test_enter_walks_older_and_wraps_past_the_oldest_match
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entries = tui.instance_variable_get(:@entries)
+    entries << { role: :info, text: 'first needle' }
+    10.times { |i| entries << { role: :info, text: "filler #{i}" } }
+    entries << { role: :info, text: 'second needle' }
+    tui.instance_variable_set(:@window, FakeWindow.new(12, 60))
+    tui.send(:draw_transcript, 12, 60)
+
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'needle')
+    oldest = tui.instance_variable_get(:@top)
+    tui.send(:handle_key, 10)
+    wrapped = tui.instance_variable_get(:@top)
+
+    assert_operator wrapped, :>, oldest, 'Enter wraps to the newest match'
+    tui.send(:handle_key, 10)
+    assert_operator tui.instance_variable_get(:@top), :<, wrapped, 'and walks older again'
+  end
+
+  def test_search_reports_when_nothing_matches
+    tui, window = scrolling_tui
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'zzz')
+    window.rows.map! { +'' }
+    tui.send(:draw_footer, 12, 60)
+
+    assert_nil tui.instance_variable_get(:@top)
+    assert_includes window.rows[9], 'no match'
+    assert_includes window.rows[9], 'Esc close'
+  end
+
+  def test_search_footer_counts_the_matches
+    tui, window = scrolling_tui
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'line 1')
+    window.rows.map! { +'' }
+    tui.send(:draw_footer, 12, 60)
+
+    assert_includes window.rows[9], '11 matches'
+  end
+
+  def test_ctrl_f_again_steps_to_the_next_match
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'line 1')
+    before = tui.instance_variable_get(:@top)
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+
+    assert_operator tui.instance_variable_get(:@top), :<, before
+  end
+
+  def test_backspace_edits_the_search_query
+    tui, = scrolling_tui
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'line 29')
+    tui.send(:handle_key, 127)
+
+    assert_equal 'line 2', tui.instance_variable_get(:@search)
+  end
+
+  def test_escape_and_ctrl_c_close_the_search_without_quitting
+    tui, = scrolling_tui
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    assert_nil tui.send(:handle_key, 27)
+    assert_nil tui.instance_variable_get(:@search)
+
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    assert_nil tui.send(:handle_key, 3)
+    assert_nil tui.instance_variable_get(:@search)
+    assert_equal :quit, tui.send(:handle_key, 3)
+  end
+
+  def test_search_works_while_a_turn_is_running
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    tui.instance_variable_set(:@busy, true)
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'line 5')
+
+    assert_equal 'line 5', tui.instance_variable_get(:@search)
+    assert_equal '', tui.instance_variable_get(:@input)
+  end
+
+  def test_input_line_shows_the_search_query
+    tui, window = scrolling_tui
+    tui.send(:handle_key, Rubycog::TUI::SEARCH_KEY)
+    type_text(tui, 'abc')
+    window.rows.map! { +'' }
+    Curses.stub(:curs_set, nil) { tui.send(:draw_input, 12, 60) }
+
+    assert_includes window.rows.last, 'find> abc'
+  end
+
+  # Delivers a mouse event the way curses does: KEY_MOUSE, then Curses.getmouse.
+  def wheel(tui, bstate)
+    event = Struct.new(:bstate).new(bstate)
+    Curses.stub(:getmouse, event) { tui.send(:handle_key, Curses::KEY_MOUSE) }
+  end
+
+  def test_wheel_up_scrolls_back_by_one_notch
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    wheel(tui, Rubycog::TUI::WHEEL_UP)
+
+    bottom = tui.instance_variable_get(:@row_count) - tui.instance_variable_get(:@body_height)
+    assert_equal bottom - Rubycog::TUI::WHEEL_STEP, tui.instance_variable_get(:@top)
+  end
+
+  def test_wheel_down_returns_to_the_tail
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    wheel(tui, Rubycog::TUI::WHEEL_UP)
+    wheel(tui, Rubycog::TUI::WHEEL_DOWN)
+
+    assert_nil tui.instance_variable_get(:@top)
+    assert_includes redraw_transcript(tui, window), 'line 29'
+  end
+
+  def test_other_mouse_events_are_ignored
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    wheel(tui, Curses::BUTTON1_PRESSED)
+
+    assert_nil tui.instance_variable_get(:@top)
+  end
+
+  def test_wheel_works_while_a_turn_is_running
+    tui, window = scrolling_tui
+    redraw_transcript(tui, window)
+    tui.instance_variable_set(:@busy, true)
+    wheel(tui, Rubycog::TUI::WHEEL_UP)
+
+    refute_nil tui.instance_variable_get(:@top)
+  end
+
+  def test_wheel_bits_match_what_ncurses_reports
+    # Measured on ncurses 6.0: wheel up arrives as KEY_MOUSE with bstate 524288.
+    assert_equal 524_288, Rubycog::TUI::WHEEL_UP
+    assert_equal 33_554_432, Rubycog::TUI::WHEEL_DOWN
+  end
+
+  def test_mouse_reporting_is_enabled_only_when_both_wheel_directions_decode
+    tui = Rubycog::TUI.new(FakeChat.new)
+    masks = []
+    Curses.stub(:mousemask, ->(mask) { masks << mask; 0 }) { tui.send(:enable_mouse) }
+
+    if Rubycog::TUI::WHEEL_SUPPORTED
+      assert_equal [Rubycog::TUI::WHEEL_UP | Rubycog::TUI::WHEEL_DOWN], masks
+    else
+      assert_empty masks
+    end
   end
 end

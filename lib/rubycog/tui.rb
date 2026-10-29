@@ -13,10 +13,20 @@ module Rubycog
   # Curses UI: transcript, input, approvals, session footer and restart.
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
-    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit"
+    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
     STATS_INTERVAL = 2.0
     CODE_COLOR = 5
-    STYLES = { code: [CODE_COLOR, 0], heading: [0, Curses::A_BOLD] }.freeze
+    SEARCH_KEY = 6 # Ctrl-F
+    WHEEL_STEP = 3 # rows per wheel notch
+    # ncurses stores button n's state in 6-bit slots, press being bit 1. Wheel
+    # down is BUTTON5, which ncurses only learnt in 6.1: on 6.0 the binding has
+    # no BUTTON5 constant and ncurses swallows those bytes (measured: wheel up
+    # arrives as KEY_MOUSE with bstate 524288, wheel down arrives as nothing).
+    WHEEL_SUPPORTED = Curses.const_defined?(:BUTTON5_PRESSED)
+    WHEEL_UP = 2 << ((4 - 1) * 6)
+    WHEEL_DOWN = 2 << ((5 - 1) * 6)
+    STYLES = { code: [CODE_COLOR, 0], heading: [0, Curses::A_BOLD], bold: [0, Curses::A_BOLD],
+               italic: [0, Curses::A_UNDERLINE], inline_code: [CODE_COLOR, 0] }.freeze
     LABELS = {
       user: ['You', 1], assistant: ['RubyCog', 2], tool: ['eval', 3],
       result: ['result', 3], error: ['Error', 4], warning: ['Warning', 3],
@@ -40,7 +50,17 @@ module Rubycog
       @bytes = +''.b
       @busy = false
       @approval = nil
-      @scroll = 0
+      @top = nil
+      @row_count = nil
+      @body_height = nil
+      @body_width = nil
+      # Search prompt state: the query while Ctrl-F is open, the row the search
+      # started from, and the last result so the footer can report it.
+      @search = nil
+      @search_anchor = 0
+      @search_found = nil
+      @match_count = 0
+      @search_bytes = +''.b
       @status = if !session
                   'ready'
                 elsif turns.empty?
@@ -69,6 +89,7 @@ module Rubycog
       @window.keypad = true
       @window.timeout = 50
       init_colors
+      enable_mouse
       start_stats_sampler
       draw
 
@@ -148,6 +169,9 @@ module Rubycog
     end
 
     def handle_key(key)
+      return approve(true) if @approval && [121, 89].include?(key)
+      return approve(false) if @approval && [110, 78].include?(key)
+      return if search_key(key) # the search prompt owns the keyboard while open
       return :quit if key == 3 && !@busy
       if key == 3
         approve(false) if @approval
@@ -155,8 +179,8 @@ module Rubycog
         @status = 'cancelling'
         return
       end
-      return approve(true) if @approval && [121, 89].include?(key)
-      return approve(false) if @approval && [110, 78].include?(key)
+      return if mouse_key(key) # wheel scrolling, also while a turn runs
+      return if scroll_key(key) # reading history must work while a turn runs
       return if @busy
 
       case key
@@ -172,29 +196,40 @@ module Rubycog
       when Curses::KEY_DC then @input.slice!(@cursor)
       when 21 then @input.slice!(0...@cursor) && @cursor = 0
       when 11 then @input.slice!(@cursor..)
-      when Curses::KEY_PPAGE then @scroll += 5
-      when Curses::KEY_NPAGE then @scroll = [@scroll - 5, 0].max
       else append_input(key)
       end
       nil
     end
 
     def append_input(key)
-      return unless key.is_a?(Integer) && key.between?(32, 255)
-
-      @bytes << key
-      text = @bytes.dup.force_encoding(Encoding::UTF_8)
-      return unless text.valid_encoding?
+      text = next_char(@bytes, key)
+      return unless text
 
       @input.insert(@cursor, text)
       @cursor += text.length
-      @bytes.clear
+    end
+
+    # Collects raw bytes from curses and returns a complete UTF-8 character, or
+    # nil while the bytes of a multi-byte character are still arriving.
+    def next_char(bytes, key)
+      return nil unless key.is_a?(Integer) && key.between?(32, 255)
+
+      bytes << key
+      text = bytes.dup.force_encoding(Encoding::UTF_8)
+      return nil unless text.valid_encoding?
+
+      bytes.clear
+      text
     end
 
     def submit
       message = @input.strip
-      return if message.empty?
+      if message.empty?
+        @top = nil # an empty Enter jumps back to the newest output
+        return
+      end
 
+      @search = nil # sending anything closes an open search prompt
       case message
       when '/quit', '/exit' then return :quit
       when '/restart'
@@ -203,6 +238,7 @@ module Rubycog
         if @agent.chat.complete?
           @agent.reset
           @entries = [{ role: :info, text: 'New conversation.' }]
+          @top = nil
           @entries << { role: :warning, text: 'YOLO: all tools run without approval.' } if @yolo
         else
           @entries << { role: :info, text: 'Finish the current step before clearing.' }
@@ -234,7 +270,7 @@ module Rubycog
         @entries << { role: :user, text: message }
         @busy = true
         @status = 'thinking'
-        @scroll = 0
+        @top = nil
         @worker = Thread.new { converse(message) }
       end
       @input.clear
@@ -387,16 +423,208 @@ module Rubycog
     end
 
     def draw_transcript(height, width)
-      rows = @entries.flat_map do |entry|
-        label, color = LABELS.fetch(entry[:role])
-        lines = [[label, color, Curses::A_BOLD]]
-        lines.concat(body_rows(entry, width))
-        lines << ['', 0, 0]
-      end
+      rows = @entries.flat_map { |entry| entry_rows(entry, width) }
       body_height = height - 5
-      @scroll = [@scroll, [rows.length - body_height, 0].max].min
-      visible = rows.last(body_height + @scroll).first(body_height)
-      visible.each_with_index { |(text, color, attribute), i| put(i + 2, 1, text, width - 2, color, attribute) }
+      @body_height = body_height
+      @body_width = width
+      @row_count = rows.length
+      top = transcript_top
+      visible = rows[top, body_height] || []
+      visible.each_with_index { |(row, color, attribute), i| put_row(i + 2, 1, row, width - 2, color, attribute) }
+    end
+
+    # The label row, the wrapped text and the blank spacer for one entry, as
+    # [row, colour, attribute] triples. Kept next to the layout cache and reused
+    # while body_rows hands back the same array, so a keystroke only allocates
+    # for the entry that is still streaming.
+    def entry_rows(entry, width)
+      body = body_rows(entry, width)
+      cached = entry[:triples]
+      return cached[:triples] if cached && cached[:rows].equal?(body)
+
+      label, color = LABELS.fetch(entry[:role])
+      triples = [[Markdown::Row.new([[+label, nil]]), color, Curses::A_BOLD]] +
+                body.map { |row| [row, 0, 0] } +
+                [[Markdown::Row.new, 0, 0]]
+      entry[:triples] = { rows: body, triples: triples }
+      triples
+    end
+
+    # Top row of the transcript viewport.
+    #
+    # @top is nil while the view follows the newest rows. Scrolling back stores
+    # an absolute row index instead of a distance from the bottom, so rows that
+    # stream in below do not push the text being read off the screen. Landing on
+    # the last page re-pins the view to the tail.
+    def transcript_top
+      max_top = [@row_count - @body_height, 0].max
+      return max_top if @top.nil?
+
+      top = [@top, max_top].min
+      @top = top >= max_top ? nil : top
+      top
+    end
+
+    # Moves the viewport; a positive delta scrolls towards older rows.
+    def scroll_by(delta)
+      return unless @row_count && @body_height
+
+      max_top = [@row_count - @body_height, 0].max
+      top = ((@top || max_top) - delta).clamp(0, max_top)
+      @top = top >= max_top ? nil : top
+    end
+
+    # Scroll keys stay available while a turn runs so history can be read
+    # during long tool calls. Returns true when the key was a scroll key.
+    def scroll_key(key)
+      return false unless @window
+
+      page = [@body_height.to_i - 1, 1].max
+      case key
+      when Curses::KEY_UP then scroll_by(1)
+      when Curses::KEY_DOWN then scroll_by(-1)
+      when Curses::KEY_PPAGE then scroll_by(page)
+      when Curses::KEY_NPAGE then scroll_by(-page)
+      else return false
+      end
+      true
+    end
+
+    # Asks ncurses for wheel events, but only where both directions decode.
+    # Mouse reporting also stops the terminal from emulating the wheel with
+    # arrow keys, and those arrows scroll both ways already on every build, so
+    # on an old ncurses turning it on would lose more than it gains.
+    def enable_mouse
+      Curses.mousemask(WHEEL_UP | WHEEL_DOWN) if WHEEL_SUPPORTED
+    rescue StandardError
+      # A terminal without mouse support keeps the keyboard scroll keys.
+    end
+
+    # Wheel movement arrives as KEY_MOUSE followed by one getmouse event. Clicks
+    # are outside the mask we ask for, so anything but wheel motion is ignored.
+    def mouse_key(key)
+      return false unless key == Curses::KEY_MOUSE
+
+      event = Curses.getmouse
+      delta = wheel_delta(event.bstate) if event
+      scroll_by(delta) if delta
+      true
+    end
+
+    # Rows a wheel event scrolls, or nil for any other mouse event.
+    def wheel_delta(bstate)
+      return WHEEL_STEP if (bstate & WHEEL_UP) != 0
+      return -WHEEL_STEP if (bstate & WHEEL_DOWN) != 0
+
+      nil
+    end
+
+    # Footer hint shown while the transcript is scrolled back.
+    def scrolled_text
+      hidden = @row_count - @top.to_i - @body_height.to_i
+      text = "scrolled back · #{hidden} newer lines · Enter returns to the end"
+      @busy ? "#{text}  ·  Ctrl-C cancel" : text
+    end
+
+    # Reverse incremental search over the transcript. Ctrl-F opens the prompt,
+    # typing jumps to the nearest match at or above where the reader was, and
+    # Enter walks to older matches and wraps around. Esc or Ctrl-C close the
+    # prompt without touching the input line. Like scrolling it works while a
+    # turn runs, because reading history does not touch the agent.
+    def search_key(key)
+      if key == SEARCH_KEY && !@search
+        open_search
+        return true
+      end
+      return false unless @search
+
+      case key
+      when 27, 3 then close_search # Esc and Ctrl-C close the prompt, not the app
+      when 10, 13 then search_next
+      when SEARCH_KEY then search_next unless @search.empty?
+      when Curses::KEY_BACKSPACE, 8, 127
+        @search = @search[0...-1]
+        rerun_search
+      else
+        return true unless (text = next_char(@search_bytes, key))
+
+        @search += text
+        rerun_search
+      end
+      true
+    end
+
+    # Enter inside an open prompt: step to the next older match, wrapping to the
+    # bottom of the transcript when the view is following the tail.
+    def search_next
+      search_jump((@top || search_row_count) - 1)
+    end
+
+    # Opens the prompt anchored at the top visible row, so the first match is
+    # found at or above what the reader is looking at.
+    def open_search
+      @search = +''
+      @search_anchor = [@top || (@row_count.to_i - @body_height.to_i), 0].max
+      @search_found = nil
+      @match_count = 0
+    end
+
+    # Closes the prompt and leaves the viewport where the search put it.
+    def close_search
+      @search = nil
+      @search_found = nil
+      @match_count = 0
+    end
+
+    # Re-runs the search from the anchor after the query changed. An empty query
+    # only waits for more typing.
+    def rerun_search
+      @search_found = nil
+      @match_count = 0
+      return if @search.empty?
+
+      search_jump(@search_anchor)
+    end
+
+    # Moves the viewport to the nearest match at or above `from`.
+    def search_jump(from)
+      index, matches = search_hits(from)
+      @search_found = index
+      @match_count = matches
+      @top = index if index
+      index
+    end
+
+    # The nearest matching row index at or above `from`, wrapping to the last
+    # match when nothing above matches, plus the total number of matches.
+    def search_hits(from)
+      rows = search_rows
+      needle = @search.downcase
+      hits = rows.each_index.select { |index| rows[index].downcase.include?(needle) }
+      return [nil, 0] if hits.empty?
+
+      [hits.reverse.find { |index| index <= from } || hits.last, hits.length]
+    end
+
+    # Plain text of every transcript row in drawing order, so search and scroll
+    # share row numbers. Layouts are cached per entry, so nothing is re-wrapped.
+    def search_rows
+      width = @body_width
+      return [] unless width
+
+      @entries.flat_map { |entry| ['', *body_rows(entry, width).map(&:text), ''] }
+    end
+
+    def search_row_count
+      @row_count || search_rows.length
+    end
+
+    # Footer line for the open search prompt.
+    def search_text
+      return 'search: type to find text · Esc cancel' if @search.empty?
+
+      found = @search_found.nil? ? 'no match' : "#{@match_count} match#{'es' unless @match_count == 1}"
+      "#{found} · Enter older · Esc close"
     end
 
     # Wrapping is linear in text length, so re-laying out every turn on each
@@ -413,10 +641,7 @@ module Rubycog
                else
                  Markdown.lines(entry[:text], body)
                end
-      rows = styled.map do |line, style|
-        color, attribute = STYLES.fetch(style, [0, 0])
-        ["  #{line}", color, attribute]
-      end
+      rows = styled.map { |row| row.indented('  ') }
       entry[:layout] = { width: body, text: entry[:text].dup, rows: rows }
       rows
     end
@@ -425,16 +650,28 @@ module Rubycog
       mode = @yolo ? '  ·  YOLO' : ''
       text = if @approval
                "Run #{@approval.name}? [y] approve once  [n] deny"
+             elsif @search
+               search_text
+             elsif @top
+               scrolled_text
              elsif @source_stale
                'code changed — /restart to apply'
              elsif @busy
                "#{@status}#{mode}  ·  Ctrl-C cancel"
              else
-               "#{@status}#{mode}  ·  Enter send  ·  /help  ·  Ctrl-C quit"
+               idle_footer_text(mode)
              end
       put(height - 3, 1, text, width - 2, @approval ? 3 : 0)
       draw_stats(height, width, Text.width(text))
       put(height - 2, 0, '─' * width, width, 1)
+    end
+
+    # Idle footer text. The scroll hint appears only once the transcript is
+    # taller than the viewport, so a short session stays uncluttered.
+    def idle_footer_text(mode)
+      text = "#{@status}#{mode}  ·  Enter send  ·  /help  ·  Ctrl-C quit"
+      text += '  ·  PgUp/PgDn scroll  ·  Ctrl-F find' if @row_count && @row_count > @body_height.to_i
+      text
     end
 
     def draw_stats(height, width, left_width)
@@ -548,14 +785,31 @@ module Rubycog
     end
 
     def draw_input(height, width)
-      prompt = '> '
+      text = @search || @input
+      cursor = @search ? text.length : @cursor
+      prompt = @search ? 'find> ' : '> '
       room = width - prompt.length - 1
-      offset = [Text.width(@input[0...@cursor]) - room + 1, 0].max
+      offset = [Text.width(text[0...cursor]) - room + 1, 0].max
       put(height - 1, 0, prompt, width, 1, Curses::A_BOLD)
-      put(height - 1, prompt.length, Text.slice(@input, offset, room), room, 0)
-      Curses.curs_set(@busy ? 0 : 1)
-      cursor = prompt.length + Text.width(@input[0...@cursor]) - offset
-      @window.setpos(height - 1, [cursor, width - 1].min)
+      put(height - 1, prompt.length, Text.slice(text, offset, room), room, 0)
+      Curses.curs_set(@busy && !@search ? 0 : 1)
+      column = prompt.length + Text.width(text[0...cursor]) - offset
+      @window.setpos(height - 1, [column, width - 1].min)
+    end
+
+    # Draws one wrapped Row: segments with their own style take the style's
+    # colour, unstyled ones fall back to the row colour (used by the labels).
+    def put_row(y, x, row, max_width, color = 0, attribute = 0)
+      used = 0
+      row.segments.each do |text, style|
+        room = max_width - used
+        break if room <= 0
+
+        seg_color, seg_attribute = style ? STYLES.fetch(style, [0, 0]) : [color, attribute]
+        chunk = Text.slice(text, 0, room)
+        put(y, x + used, chunk, room, seg_color, seg_attribute)
+        used += Text.width(chunk)
+      end
     end
 
     def put(y, x, text, max_width, color = 0, attribute = 0)
