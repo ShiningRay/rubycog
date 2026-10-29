@@ -35,8 +35,14 @@ module Rubycog
       self
     end
 
-    def save(messages)
-      @messages = self.class.extract(messages).last(MAX_MESSAGES)
+    # Stores the conversation, recording when each turn was written.
+    #
+    # The chat itself cannot carry a timestamp, so `stamps` is an optional
+    # list of `{ role:, text:, at: }` in the order the screen showed them;
+    # stamp matches them onto the stored turns (see below).
+    def save(messages, stamps: nil)
+      turns = self.class.stamp(self.class.extract(messages), stamps)
+      @messages = turns.last(MAX_MESSAGES)
       write
       self
     end
@@ -53,6 +59,9 @@ module Rubycog
     # Consecutive assistant text messages are merged: tool-call rounds produce
     # several assistant messages, and replaying them as separate turns makes
     # the restored conversation look like the model talked to itself.
+    #
+    # A turn that already carries an ISO8601 'at' keeps it, so re-reading a
+    # file and saving it again does not move the timestamps.
     def self.extract(messages)
       turns = []
       Array(messages).each do |message|
@@ -63,10 +72,62 @@ module Rubycog
         if role == 'assistant' && turns.last && turns.last['role'] == 'assistant'
           turns.last['content'] = "#{turns.last['content']}\n\n#{content}"
         else
-          turns << { 'role' => role, 'content' => content }
+          turn = { 'role' => role, 'content' => content }
+          at = field(message, :at)
+          turn['at'] = at if time_string?(at)
+          turns << turn
         end
       end
       turns
+    end
+
+    # True for a timestamp that can be read back, so a hand-edited or older
+    # session file degrades to "no time" instead of crashing.
+    def self.time_string?(value)
+      return false unless value.is_a?(String) && !value.empty?
+
+      Time.iso8601(value)
+      true
+    rescue ArgumentError
+      false
+    end
+
+    # Copies the time each message appeared on screen onto the stored turn
+    # that contains it.
+    #
+    # The two lists do not line up: one turn can span several tool rounds (so
+    # extract merges several assistant messages), and compaction drops turns
+    # from the chat while the screen keeps them. So both are walked in order,
+    # and a turn takes the time of the first stamp whose text is its next
+    # piece of content. A turn with no match stays untimestamped rather than
+    # claiming the save time.
+    def self.stamp(turns, stamps)
+      entries = Array(stamps)
+      cursor = 0
+      turns.each do |turn|
+        content = turn['content'].to_s
+        position = 0
+        start = (cursor...entries.length).find { |i| continues?(entries[i], turn['role'], content, position) }
+        next unless start
+
+        cursor = start
+        turn['at'] ||= iso_time(entries[cursor][:at])
+        while (entry = entries[cursor]) && continues?(entry, turn['role'], content, position)
+          position += entry[:text].to_s.length + 2
+          cursor += 1
+        end
+      end
+      turns
+    end
+
+    # True when the entry is the next piece of the turn's text at `position`.
+    def self.continues?(entry, role, content, position)
+      text = entry[:text].to_s
+      entry[:role].to_s == role && !text.empty? && content[position, text.length] == text
+    end
+
+    def self.iso_time(time)
+      time.respond_to?(:utc) ? time.utc.iso8601 : nil
     end
 
     def self.field(message, name)
@@ -93,7 +154,7 @@ module Rubycog
       return unless path
 
       FileUtils.mkdir_p(File.dirname(path))
-      payload = { 'version' => 1, 'updated_at' => Time.now.utc.iso8601, 'messages' => messages }
+      payload = { 'version' => 2, 'updated_at' => Time.now.utc.iso8601, 'messages' => messages }
       tmp = "#{path}.#{Process.pid}.tmp"
       File.write(tmp, JSON.pretty_generate(payload))
       File.chmod(0o600, tmp)

@@ -3,6 +3,7 @@
 require 'curses'
 require 'io/console'
 require 'rbconfig'
+require 'time'
 require_relative 'text'
 require_relative 'eval_tool'
 require_relative 'tool_preview'
@@ -15,6 +16,7 @@ module Rubycog
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
     HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
     STATS_INTERVAL = 2.0
+    TICK_INTERVAL = 0.25 # footer clock repaint while a turn runs
     CODE_COLOR = 5
     SEARCH_KEY = 6 # Ctrl-F
     WHEEL_STEP = 3 # rows per wheel notch
@@ -73,6 +75,11 @@ module Rubycog
       @objects = nil
       @memory = nil
       @stats_at = nil
+      # Turn timing: when the current turn started and which transcript entry
+      # opened it, so the finished duration lands on the right entry.
+      @turn_started_at = nil
+      @turn_index = nil
+      @tick_at = nil
       @shown_code = nil
       @source_digest = source_snapshot
       @source_stale = false
@@ -101,8 +108,9 @@ module Rubycog
         break if action == :quit || action == :restart
 
         # The 50ms read timeout wakes the loop even when nothing happened;
-        # redrawing then only burns CPU proportional to transcript size.
-        draw if key || changed
+        # redrawing then only burns CPU proportional to transcript size. The
+        # exception is the running turn clock, which needs repaints of its own.
+        draw if key || changed || live_tick?
       end
     ensure
       if @busy
@@ -128,9 +136,31 @@ module Rubycog
       "#{@session.path} · #{count} turns"
     end
 
-    # Prior turns are shown under the welcome banner after a restart.
+    # Prior turns are shown under the welcome banner after a restart, with the
+    # time the session file recorded for each one.
     def history_entries(history)
-      Session.extract(history).map { |message| { role: message['role'].to_sym, text: message['content'] } }
+      Session.extract(history).map do |message|
+        { role: message['role'].to_sym, text: message['content'], at: parse_clock(message['at']) }
+      end
+    end
+
+    # Reads a stored ISO8601 timestamp, or nil when it is missing or unreadable.
+    def parse_clock(value)
+      value.is_a?(String) ? Time.iso8601(value) : nil
+    rescue ArgumentError
+      nil
+    end
+
+    # "14:32" for today, "05-03 14:32" for older turns, so a conversation
+    # resumed from last week still reads correctly without wasting columns.
+    def format_clock(at)
+      return '' unless at
+
+      local = at.getlocal
+      now = Time.now
+      return local.strftime('%H:%M') if local.year == now.year && local.yday == now.yday
+
+      local.strftime('%m-%d %H:%M')
     end
 
     # Self-edits change files on disk; the running process keeps the old
@@ -267,7 +297,8 @@ module Rubycog
           @entries << { role: :info, text: 'YOLO off: eval requires approval.' }
         end
       else
-        @entries << { role: :user, text: message }
+        @entries << { role: :user, text: message, at: Time.now }
+        start_turn
         @busy = true
         @status = 'thinking'
         @top = nil
@@ -358,6 +389,7 @@ module Rubycog
           @busy = false
           @status = 'ready'
           @streaming = false
+          finish_turn
         end
       end
       handled
@@ -374,7 +406,7 @@ module Rubycog
 
     def append_text(text)
       unless @streaming
-        @entries << { role: :assistant, text: +'' }
+        @entries << { role: :assistant, text: +'', at: Time.now }
         @streaming = true
       end
       @entries.last[:text] << text
@@ -433,6 +465,17 @@ module Rubycog
       visible.each_with_index { |(row, color, attribute), i| put_row(i + 2, 1, row, width - 2, color, attribute) }
     end
 
+    # Label row pieces, joined by the caller: the role name, then when the
+    # message was written, then how long the turn took. Tool and info rows
+    # carry a name only.
+    def label_parts(name, entry)
+      parts = [name]
+      clock = format_clock(entry[:at])
+      parts << clock unless clock.empty?
+      parts << format_duration(entry[:elapsed]) if entry[:elapsed]
+      parts
+    end
+
     # The label row, the wrapped text and the blank spacer for one entry, as
     # [row, colour, attribute] triples. Kept next to the layout cache and reused
     # while body_rows hands back the same array, so a keystroke only allocates
@@ -443,6 +486,7 @@ module Rubycog
       return cached[:triples] if cached && cached[:rows].equal?(body)
 
       label, color = LABELS.fetch(entry[:role])
+      label = label_parts(label, entry).join(' · ')
       triples = [[Markdown::Row.new([[+label, nil]]), color, Curses::A_BOLD]] +
                 body.map { |row| [row, 0, 0] } +
                 [[Markdown::Row.new, 0, 0]]
@@ -657,13 +701,20 @@ module Rubycog
              elsif @source_stale
                'code changed — /restart to apply'
              elsif @busy
-               "#{@status}#{mode}  ·  Ctrl-C cancel"
+               "#{busy_text}#{mode}  ·  Ctrl-C cancel"
              else
                idle_footer_text(mode)
              end
       put(height - 3, 1, text, width - 2, @approval ? 3 : 0)
       draw_stats(height, width, Text.width(text))
       put(height - 2, 0, '─' * width, width, 1)
+    end
+
+    # Busy footer text: the current status plus how long the turn has run, so a
+    # long tool call looks busy rather than stuck.
+    def busy_text
+      elapsed = live_elapsed
+      elapsed ? "#{@status} · #{format_duration(elapsed)}" : @status
     end
 
     # Idle footer text. The scroll hint appears only once the transcript is
@@ -734,11 +785,21 @@ module Rubycog
     def save_session
       return true unless @session
 
-      @session.save(@agent.chat.messages)
+      @session.save(@agent.chat.messages, stamps: message_stamps)
       true
     rescue StandardError => e
       @entries << { role: :error, text: "session save failed: #{e.class}: #{e.message}" }
       false
+    end
+
+    # The timestamped user and assistant entries, in the order the screen
+    # showed them, so the session can record when each turn was written.
+    def message_stamps
+      @entries.filter_map do |entry|
+        next unless %i[user assistant].include?(entry[:role]) && entry[:at]
+
+        { role: entry[:role], text: entry[:text], at: entry[:at] }
+      end
     end
 
     def collect_garbage
@@ -781,6 +842,73 @@ module Rubycog
         format('%.1f MB', bytes / 1024.0**2)
       else
         format('%.0f KB', bytes / 1024.0)
+      end
+    end
+
+    # Monotonic clock reading, so turn timings ignore wall-clock jumps.
+    def monotonic
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    # Starts timing a user turn; the question's entry index is remembered so the
+    # duration can be attached to whatever the turn ends up producing.
+    def start_turn
+      @turn_started_at = monotonic
+      @turn_index = @entries.length - 1
+      @tick_at = nil
+    end
+
+    # Stamps the turn that just finished with how long it took and returns the
+    # seconds. The duration goes on the turn's last answer, or on the question
+    # when the turn produced no text (cancelled, or tools only).
+    def finish_turn
+      started = @turn_started_at
+      return unless started && @turn_index
+
+      elapsed = monotonic - started
+      @turn_started_at = nil
+      @tick_at = nil
+      entry = turn_answer || @entries[@turn_index]
+      @turn_index = nil
+      return unless entry
+
+      entry[:elapsed] = elapsed
+      entry.delete(:triples) # the label row grew, so relayout this entry
+      elapsed
+    end
+
+    # The last assistant entry written after the turn started, if any.
+    def turn_answer
+      index = @entries.rindex { |entry| entry[:role] == :assistant }
+      index && index >= @turn_index ? @entries[index] : nil
+    end
+
+    # Seconds the running turn has taken, or nil while nothing is running.
+    def live_elapsed
+      @turn_started_at ? monotonic - @turn_started_at : nil
+    end
+
+    # The footer clock only needs a few repaints a second, and the loop already
+    # wakes every 50ms for the key read, so this throttles those wake-ups
+    # instead of adding a timer thread.
+    def live_tick?
+      return false unless @turn_started_at
+
+      now = monotonic
+      return false if @tick_at && now - @tick_at < TICK_INTERVAL
+
+      @tick_at = now
+      true
+    end
+
+    # "0.8s" below ten seconds, "42s" below a minute, "2m 05s" beyond that.
+    def format_duration(seconds)
+      if seconds < 10
+        format('%.1fs', seconds)
+      elsif seconds < 60
+        format('%ds', seconds)
+      else
+        format('%dm %02ds', seconds / 60, seconds % 60)
       end
     end
 

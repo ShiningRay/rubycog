@@ -404,14 +404,14 @@ end
     saved = []
     session = Object.new
     session.define_singleton_method(:path) { '/tmp/session.json' }
-    session.define_singleton_method(:save) { |messages| saved << messages }
+    session.define_singleton_method(:save) { |messages, stamps: nil| saved << [messages, stamps] }
     chat = FakeChat.new
     agent = Struct.new(:chat).new(chat)
     tui = Rubycog::TUI.new(agent, session: session)
     tui.instance_variable_set(:@input, +'/restart')
 
     assert_equal :restart, tui.send(:submit)
-    assert_equal [chat.messages], saved
+    assert_equal [chat.messages, []], saved.first
   end
 
   def test_footer_marks_code_changes_as_needing_restart
@@ -452,13 +452,13 @@ end
   def test_enter_returns_restart_for_restart_command
     saved = []
     session = Struct.new(:path).new('/tmp/session.json')
-    session.define_singleton_method(:save) { |messages| saved << messages }
+    session.define_singleton_method(:save) { |messages, stamps: nil| saved << [messages, stamps] }
     chat = FakeChat.new
     tui = Rubycog::TUI.new(Struct.new(:chat).new(chat), session: session)
     tui.instance_variable_set(:@input, +'/restart')
 
     assert_equal :restart, tui.send(:handle_key, 13)
-    assert_equal [chat.messages], saved
+    assert_equal [chat.messages, []], saved.first
   end
 
   def test_self_command_reports_iteration_history
@@ -768,5 +768,146 @@ end
     else
       assert_empty masks
     end
+  end
+
+  # Turn timing. The tests backdate @turn_started_at instead of sleeping.
+  def test_finished_turn_records_how_long_it_took
+    tui = Rubycog::TUI.new(FakeChat.new)
+    events = tui.instance_variable_get(:@events)
+    tui.instance_variable_get(:@entries) << { role: :user, text: 'hi' }
+    tui.send(:start_turn)
+    events << { type: :text, payload: 'the answer' }
+    tui.send(:drain_events)
+    tui.instance_variable_set(:@turn_started_at, tui.send(:monotonic) - 3.25)
+    events << { type: :done, payload: nil }
+    tui.send(:drain_events)
+
+    answer = tui.instance_variable_get(:@entries).reverse_each.find { |entry| entry[:role] == :assistant }
+    assert_in_delta 3.25, answer[:elapsed], 0.2
+    assert_nil tui.instance_variable_get(:@turn_started_at)
+  end
+
+  def test_cancelled_turn_records_the_duration_on_the_question
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_get(:@entries) << { role: :user, text: 'hi' }
+    tui.send(:start_turn)
+    tui.instance_variable_set(:@turn_started_at, tui.send(:monotonic) - 1.5)
+    tui.instance_variable_get(:@events) << { type: :done, payload: nil }
+    tui.send(:drain_events)
+
+    question = tui.instance_variable_get(:@entries).last
+    assert_equal :user, question[:role]
+    assert_in_delta 1.5, question[:elapsed], 0.2
+  end
+
+  def test_transcript_shows_the_duration_next_to_the_answer
+    tui = Rubycog::TUI.new(FakeChat.new)
+    window = FakeWindow.new(20, 60)
+    tui.instance_variable_set(:@window, window)
+    events = tui.instance_variable_get(:@events)
+    tui.instance_variable_get(:@entries) << { role: :user, text: 'hi' }
+    tui.send(:start_turn)
+    events << { type: :text, payload: 'the answer' }
+    tui.send(:drain_events)
+    now = Time.now
+    tui.instance_variable_get(:@entries).last[:at] = Time.local(now.year, now.month, now.day, 9, 5)
+    tui.send(:draw_transcript, 20, 60) # lays the turn out and caches its rows
+    tui.instance_variable_set(:@turn_started_at, tui.send(:monotonic) - 3.2)
+    events << { type: :done, payload: nil }
+    tui.send(:drain_events)
+    window.rows.each(&:clear)
+    tui.send(:draw_transcript, 20, 60)
+
+    assert_includes window.rows.join("\n"), 'RubyCog · 09:05 · 3.2s'
+  end
+
+  def test_footer_shows_the_running_turn_clock
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@busy, true)
+    tui.instance_variable_set(:@status, 'thinking')
+    tui.instance_variable_set(:@turn_started_at, tui.send(:monotonic) - 42)
+    window = FakeWindow.new(10, 120)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_footer, 10, 120)
+    drawn = window.rows.join("\n")
+
+    assert_includes drawn, 'thinking · 42s'
+    assert_includes drawn, 'Ctrl-C cancel'
+  end
+
+  def test_live_clock_repaints_only_while_a_turn_runs
+    tui = Rubycog::TUI.new(FakeChat.new)
+    refute tui.send(:live_tick?)
+
+    tui.instance_variable_get(:@entries) << { role: :user, text: 'hi' }
+    tui.send(:start_turn)
+    assert tui.send(:live_tick?)
+    refute tui.send(:live_tick?) # throttled to TICK_INTERVAL
+  end
+
+  def test_duration_formatting
+    tui = Rubycog::TUI.new(FakeChat.new)
+
+    assert_equal '0.8s', tui.send(:format_duration, 0.84)
+    assert_equal '42s', tui.send(:format_duration, 42.4)
+    assert_equal '2m 05s', tui.send(:format_duration, 125.0)
+  end
+
+  def test_sent_question_is_timestamped
+    chat = FakeChat.new
+    agent = Struct.new(:chat) { def ask(*) = nil }
+    tui = Rubycog::TUI.new(agent.new(chat))
+    tui.instance_variable_set(:@input, +'hi')
+    before = Time.now
+    tui.send(:submit)
+    tui.instance_variable_get(:@worker).join(2)
+
+    at = tui.instance_variable_get(:@entries).find { |entry| entry[:role] == :user }[:at]
+    assert_operator at, :>=, before
+    assert_operator at, :<=, Time.now
+  end
+
+  def test_transcript_shows_when_a_message_was_written
+    tui = Rubycog::TUI.new(FakeChat.new)
+    now = Time.now
+    tui.instance_variable_get(:@entries) << { role: :user, text: 'hi',
+                                              at: Time.local(now.year, now.month, now.day, 9, 5) }
+    window = FakeWindow.new(20, 60)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_transcript, 20, 60)
+
+    assert_includes window.rows.join("\n"), 'You · 09:05'
+  end
+
+  def test_resumed_turns_carry_the_saved_time
+    history = [{ 'role' => 'user', 'content' => 'earlier', 'at' => '2024-05-03T12:00:00Z' }]
+    tui = Rubycog::TUI.new(FakeChat.new, history: history)
+
+    entry = tui.instance_variable_get(:@entries).find { |candidate| candidate[:role] == :user }
+    assert_equal Time.utc(2024, 5, 3, 12, 0, 0), entry[:at]
+  end
+
+  def test_older_timestamps_show_the_date_and_today_shows_only_the_clock
+    tui = Rubycog::TUI.new(FakeChat.new)
+    now = Time.now
+
+    assert_equal now.strftime('%H:%M'), tui.send(:format_clock, now)
+    assert_equal '05-03 09:05', tui.send(:format_clock, Time.local(2024, 5, 3, 9, 5))
+    assert_equal '', tui.send(:format_clock, nil)
+  end
+
+  def test_restart_passes_the_message_times_to_the_session
+    saved = []
+    session = Object.new
+    session.define_singleton_method(:path) { '/tmp/session.json' }
+    session.define_singleton_method(:save) { |messages, stamps: nil| saved << stamps }
+    tui = Rubycog::TUI.new(Struct.new(:chat).new(FakeChat.new), session: session)
+    at = Time.utc(2024, 5, 3, 12, 0, 0)
+    tui.instance_variable_get(:@entries) << { role: :user, text: 'hi', at: at }
+    tui.instance_variable_get(:@entries) << { role: :info, text: 'not a message' }
+    tui.instance_variable_set(:@input, +'/restart')
+
+    assert_equal :restart, tui.send(:submit)
+    assert_equal [{ role: :user, text: 'hi', at: at }], saved.first
   end
 end

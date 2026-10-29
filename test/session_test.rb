@@ -91,4 +91,59 @@ class SessionTest < Minitest::Test
 
     assert_equal '/tmp/custom.json', path
   end
+
+  def test_records_when_each_turn_was_written
+    at = Time.utc(2024, 5, 3, 12, 0, 0)
+    session = Rubycog::Session.new(@path)
+    session.save([{ 'role' => 'user', 'content' => 'q' }, { 'role' => 'assistant', 'content' => 'a' }],
+                 stamps: [{ role: :user, text: 'q', at: at }, { role: :assistant, text: 'a', at: at + 5 }])
+
+    assert_equal %w[2024-05-03T12:00:00Z 2024-05-03T12:00:05Z], session.messages.map { |message| message['at'] }
+  end
+
+  def test_merged_assistant_turn_keeps_the_time_of_its_first_message
+    at = Time.utc(2024, 5, 3, 12, 0, 0)
+    session = Rubycog::Session.new(@path)
+    session.save([{ 'role' => 'user', 'content' => 'q' },
+                  { 'role' => 'assistant', 'content' => 'a1' },
+                  { 'role' => 'assistant', 'content' => 'a2' }],
+                 stamps: [{ role: :user, text: 'q', at: at },
+                          { role: :assistant, text: 'a1', at: at + 2 },
+                          { role: :assistant, text: 'a2', at: at + 9 }])
+
+    assert_equal "a1\n\na2", session.messages.last['content']
+    assert_equal '2024-05-03T12:00:02Z', session.messages.last['at']
+  end
+
+  # Compaction rewrites the chat, so a briefing sits in front of turns the
+  # screen still shows; matching has to resume at the first kept turn.
+  def test_turns_missing_from_the_screen_stay_untimed_and_later_ones_still_match
+    at = Time.utc(2024, 5, 3, 12, 0, 0)
+    session = Rubycog::Session.new(@path)
+    session.save([{ 'role' => 'user', 'content' => 'Compacted summary of the earlier conversation: x' },
+                  { 'role' => 'user', 'content' => 'kept question' },
+                  { 'role' => 'assistant', 'content' => 'kept answer' }],
+                 stamps: [{ role: :user, text: 'lost question', at: at },
+                          { role: :user, text: 'kept question', at: at + 60 },
+                          { role: :assistant, text: 'kept answer', at: at + 62 }])
+
+    refute session.messages.first.key?('at')
+    assert_equal %w[2024-05-03T12:01:00Z 2024-05-03T12:01:02Z], session.messages.drop(1).map { |m| m['at'] }
+  end
+
+  def test_resaving_a_reloaded_session_keeps_the_timestamps
+    at = Time.utc(2024, 5, 3, 12, 0, 0)
+    Rubycog::Session.new(@path).save([{ 'role' => 'user', 'content' => 'q' }],
+                                     stamps: [{ role: :user, text: 'q', at: at }])
+
+    Rubycog::Session.new(@path).save(Rubycog::Session.new(@path).messages)
+
+    assert_equal '2024-05-03T12:00:00Z', Rubycog::Session.new(@path).messages.first['at']
+  end
+
+  def test_ignores_an_unreadable_timestamp_in_the_file
+    File.write(@path, JSON.generate('messages' => [{ 'role' => 'user', 'content' => 'q', 'at' => 'whenever' }]))
+
+    assert_equal [{ 'role' => 'user', 'content' => 'q' }], Rubycog::Session.new(@path).messages
+  end
 end
