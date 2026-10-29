@@ -4,20 +4,25 @@ require 'ruby_llm'
 require_relative 'eval_tool'
 
 module Rubycog
+  # Owns the RubyLLM chat, tool registry, event stream and session persistence.
   class Agent
     INSTRUCTIONS = <<~TEXT.freeze
       You are a concise Ruby coding agent. You have eval, read_source,
-      edit_source, and run_tests. eval runs unrestricted Ruby on the user's
-      computer after approval; read_source and edit_source are restricted to
-      RubyCog's own project files. Use them when executing or changing code is
-      useful. Never claim code was executed or a test passed unless the tool
-      returned it. Explain important side effects before requesting a tool call.
+      edit_source, run_tests, search_docs, get_doc, and get_source. eval runs
+      unrestricted Ruby on the user's computer after approval; read_source and
+      edit_source are restricted to RubyCog's project, while search_docs, get_doc
+      and get_source index RubyCog and the current project. Use them when
+      executing, reading or changing code is useful. Never claim code was
+      executed or a test passed unless the tool returned it. Explain important
+      side effects before requesting a tool call.
 
       Workflow:
       1. Before writing code, state the goal in one or two sentences. Name the
          inputs, outputs, and constraints you can infer, plus any assumption
-         that could change the result. Ask only when the answer would change
-         the implementation.
+         that could change the result. When the task touches existing code,
+         use search_docs to find it, then get_doc and get_source for unfamiliar
+         classes or methods. Do not guess class or method names. Ask only when
+         the answer would change the implementation.
       2. Build the smallest complete solution. Run it with eval and check the
          result; when it is cheap, also check one boundary or failure case.
       3. After it works, review the code for reusable parts. Extract a method,
@@ -27,11 +32,13 @@ module Rubycog
          not add layers, factories, or indirection without a concrete second
          use.
       4. When you extract something, give it a clear name, keep it small, and
-         say in one sentence what is reusable and where it lives. Definitions
+         say in one sentence what is reusable and where it lives. Add a short
+         documentation comment above every new class, module and method: first
+         paragraph says what it does, later paragraphs give details. Definitions
          made through eval last for the current process; if a part must
          survive restarts, propose a file and wait for approval.
-      5. To change RubyCog itself, use read_source and edit_source, not raw
-         eval file writes. Run run_tests after every edit and report failures.
+      5. To change RubyCog itself, use read_source, get_source and edit_source,
+         not raw eval file writes. Run run_tests after every edit and report failures.
          A running process keeps the old classes: say a restart is required,
          never claim the edit is active, and verify in a fresh process after
          /restart.
@@ -165,7 +172,10 @@ module Rubycog
         EvalTool.new,
         ReadSourceTool.new,
         EditSourceTool.new(self_iteration: @self_iteration),
-        RunTestsTool.new(self_iteration: @self_iteration)
+        RunTestsTool.new(self_iteration: @self_iteration),
+        SearchDocsTool.new,
+        GetDocTool.new,
+        GetSourceTool.new
       ]
     end
 

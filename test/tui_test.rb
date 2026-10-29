@@ -462,9 +462,11 @@ end
     edit = Struct.new(:name, :arguments).new('edit_source',
                                              { 'path' => 'lib/rubycog/agent.rb', 'reason' => 'fix' })
     tests = Struct.new(:name, :arguments).new('run_tests', { 'paths' => 'test/agent_test.rb' })
+    docs = Struct.new(:name, :arguments).new('search_docs', { 'query' => 'approval session' })
 
     assert_includes Rubycog::ToolPreview.for(edit), 'edit lib/rubycog/agent.rb'
     assert_includes Rubycog::ToolPreview.for(edit), 'fix'
     assert_includes Rubycog::ToolPreview.for(tests), 'test/agent_test.rb'
+    assert_includes Rubycog::ToolPreview.for(docs), 'approval session'
   end
 end

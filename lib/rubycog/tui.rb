@@ -10,6 +10,7 @@ require_relative 'self_iteration'
 require_relative 'session'
 
 module Rubycog
+  # Curses UI: transcript, input, approvals, session footer and restart.
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
     HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit"

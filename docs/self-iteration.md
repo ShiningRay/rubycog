@@ -17,13 +17,17 @@
 
 | 组件 | 位置 | 职责 |
 | --- | --- | --- |
-| `Agent` | `lib/rubycog/agent.rb` | 注册四个工具；推送 `tool_call` / `tool_result` 事件；会话持久化 |
+| `Agent` | `lib/rubycog/agent.rb` | 注册七个工具；推送 `tool_call` / `tool_result` 事件；会话持久化 |
 | `EvalTool` | `lib/rubycog/eval_tool.rb` | 执行任意 Ruby；保留进程内定义；错误转为文本 |
 | `ReadSourceTool` | `lib/rubycog/tools/read_source.rb` | 只读白名单源码，带行号与区间 |
+| `SearchDocsTool` | `lib/rubycog/tools/search_docs.rb` | 按关键词检索源码文档注释 |
+| `GetDocTool` | `lib/rubycog/tools/get_doc.rb` | 读类/方法文档注释，`ri` 兜底 |
+| `GetSourceTool` | `lib/rubycog/tools/get_source.rb` | 读方法源码，索引 + 运行时回退 |
 | `EditSourceTool` | `lib/rubycog/tools/edit_source.rb` | 唯一匹配替换；备份、原子写、语法检查、回滚、审计 |
 | `RunTestsTool` | `lib/rubycog/tools/run_tests.rb` | 在项目根执行指定测试或全量测试；超时与输出截断 |
 | `SourcePath` | `lib/rubycog/source_path.rb` | 路径白名单、目录逃逸与符号链接检查、受保护文件 |
 | `SourceEdit` | `lib/rubycog/source_edit.rb` | 读取、diff、备份、原子写、`ruby -c`、恢复 |
+| `SourceDocs` | `lib/rubycog/source_docs.rb` | 文档注释索引、搜索、方法源码提取 |
 | `SelfIteration` | `lib/rubycog/self_iteration.rb` | 追加式审计记录 `.rubycog/self_iteration.json` |
 | `ToolPreview` | `lib/rubycog/tool_preview.rb` | 审批与 TUI 展示用的调用摘要 |
 | `TUI` | `lib/rubycog/tui.rb` | 审批提示、`/self`、`/restart`、源码变更提示、会话恢复 |
@@ -33,6 +37,7 @@
 
 ```
 用户请求 / eval 错误 / 测试失败
+  → search_docs / get_doc / get_source 定位能力与契约（只读，免审批）
   → read_source 读取目标文件（只读，免审批）
   → edit_source 计划修改（唯一匹配）
   → 用户批准
@@ -230,6 +235,8 @@ bundle exec rake test
 - `edit_source` 写入并记录审计；
 - `run_tests` 成功/失败、非 `test/` 路径拒绝；
 - `SelfIteration` 记录、摘要、损坏文件容错、条数上限；
+- `SourceDocs` 索引、搜索、类/方法文档读取、方法源码边界、排除目录；
+- `search_docs` / `get_doc` / `get_source` 三个工具；
 - Agent 注册四个工具；
 - TUI `/self`、审批提示中的工具名、`ToolPreview`。
 
@@ -261,7 +268,7 @@ bundle exec rake test
 
 ## 12. 与 eval 自修复的关系
 
-`docs/self-healing-eval.md` 解决“错误怎么诊断”：eval 异常、框架帧、用户代码/依赖/环境的分诊。本文解决“诊断为框架问题后怎么安全地改并验证”。
+`docs/self-healing-eval.md` 解决“错误怎么诊断”：eval 异常、框架帧、用户代码/依赖/环境的分诊。本文解决“诊断为框架问题后怎么安全地改并验证”。源码注释约定与 `search_docs` / `get_doc` / `get_source` 的用法见 [source-docs.md](source-docs.md)。
 
 两者组合：
 

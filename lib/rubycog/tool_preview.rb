@@ -18,6 +18,14 @@ module Rubycog
       when 'run_tests'
         paths = Array(arguments['paths']).reject(&:empty?)
         paths.empty? ? 'run all tests' : "run tests: #{paths.join(', ')}"
+      when 'search_docs'
+        "search docs: #{arguments['query']}"
+      when 'get_doc'
+        target = [arguments['class_name'], arguments['method']].compact.join('#')
+        "read doc: #{target}"
+      when 'get_source'
+        target = [arguments['class_name'], arguments['method']].compact.join('#')
+        "read source: #{target}"
       else
         arguments.inspect
       end

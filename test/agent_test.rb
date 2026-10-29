@@ -195,7 +195,7 @@ class AgentTest < Minitest::Test
       Rubycog::Agent.new
     end
 
-    assert_equal %w[eval read_source edit_source run_tests], chat.tool_names
+    assert_equal %w[eval read_source edit_source run_tests search_docs get_doc get_source], chat.tool_names
   end
 
   def test_compacts_a_long_history_before_asking_and_persists_the_summary

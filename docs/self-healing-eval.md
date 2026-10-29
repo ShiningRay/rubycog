@@ -148,6 +148,8 @@ v2 增强：强制先提交一个会失败的测试（失败测试先行），�
 
 `edit_source` 不提供整文件覆盖，避免误删用户改动。新建文件时 `old_string: ""`，仅允许 `test/` 与 `docs/`。
 
+定位阶段优先用 `search_docs` / `get_doc` / `get_source`（见 [source-docs.md](source-docs.md)），确认类、方法与注释后再决定是否改文件。
+
 ### 6.2 路径白名单
 
 允许：
