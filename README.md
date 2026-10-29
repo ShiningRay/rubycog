@@ -28,27 +28,20 @@ gem install rubycog
 
 ## 启动
 
-配置所选模型的提供商密钥，然后启动：
+默认使用 **DeepSeek V4.1 Flash**（官方 API 模型 ID：`deepseek-flash`），只需配置密钥：
 
 ```sh
-# 任选一家，只需配置要使用的提供商
-export OPENAI_API_KEY='...'
-# export ANTHROPIC_API_KEY='...'
-# export GEMINI_API_KEY='...'
-# export DEEPSEEK_API_KEY='...'
-# export OPENROUTER_API_KEY='...'
-
+export DEEPSEEK_API_KEY='你的 DeepSeek API 密钥'
 bin/rubycog
-# 如果通过 gem 安装：rubycog
 ```
 
-默认使用 RubyLLM 的模型。建议明确指定你的提供商支持的模型：
+密钥只从环境变量读取，不会写入项目或日志。如需其他提供商，可配置 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 或 `OPENROUTER_API_KEY`，并用 `--model` 选择对应模型：
 
 ```sh
 bin/rubycog --model gpt-5-mini
 bin/rubycog --model claude-sonnet-4-6
 bin/rubycog --model gemini-3-flash-preview
-# 或设置默认模型
+# 或用环境变量覆盖默认模型
 export RUBYCOG_MODEL='gpt-5-mini'
 ```
 

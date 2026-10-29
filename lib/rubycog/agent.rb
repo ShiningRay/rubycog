@@ -17,6 +17,8 @@ module Rubycog
       openai anthropic gemini deepseek openrouter mistral perplexity xai
     ].freeze
 
+    DEFAULT_MODEL = 'deepseek-flash'
+
     attr_reader :chat, :model
 
     def self.configure(env: ENV)
@@ -31,7 +33,11 @@ module Rubycog
           config.public_send("#{provider}_api_base=", base) if present?(base)
         end
 
-        config.default_model = env['RUBYCOG_MODEL'] if present?(env['RUBYCOG_MODEL'])
+        config.default_model = if present?(env['RUBYCOG_MODEL'])
+                                 env['RUBYCOG_MODEL']
+                               else
+                                 DEFAULT_MODEL
+                               end
       end
     end
 

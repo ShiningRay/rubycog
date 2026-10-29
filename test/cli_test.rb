@@ -16,6 +16,12 @@ class CLITest < Minitest::Test
     assert_includes error.string, 'invalid option'
   end
 
+  def test_defaults_to_deepseek_flash
+    Rubycog::Agent.configure(env: {})
+    assert_equal 'deepseek-flash', RubyLLM.config.default_model
+    assert_equal 'deepseek', RubyLLM.models.find('deepseek-flash').provider
+  end
+
   def test_configures_providers_from_environment
     env = {
       'OPENAI_API_KEY' => 'test-key',
