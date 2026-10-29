@@ -1,0 +1,6 @@
+.bundle/
+coverage/
+pkg/
+tmp/
+.env
+.DS_Store
