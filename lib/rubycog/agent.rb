@@ -71,12 +71,14 @@ module Rubycog
       !value.to_s.strip.empty?
     end
 
-    def initialize(model: nil, chat: nil, tool: nil, tools: nil, session: nil, self_iteration: nil)
+    def initialize(model: nil, chat: nil, tool: nil, tools: nil, session: nil, self_iteration: nil,
+                   compactor: nil)
       @model = model
       @tool = tool
       @self_iteration = self_iteration
       @tools = tools || (tool ? [tool] : default_tools)
       @session = session
+      @compactor = compactor || Compactor.new(model: model)
       @chat = chat || build_chat
       @session&.restore(@chat)
     end
@@ -88,7 +90,21 @@ module Rubycog
     end
 
     def ask(message, &on_event)
-      run_step(on_event) { @chat.ask(message, &stream) }
+      run_step(on_event) do
+        auto_compact
+        @chat.ask(message, &stream)
+      end
+    end
+
+    # Replaces a long history with a model-written summary. Returns the summary,
+    # or nil when there was nothing to compact or a tool round is still open.
+    def compact(&on_event)
+      return nil unless @chat.complete?
+
+      run_step(on_event) do
+        emit(:status, 'compacting context')
+        @compactor.compact(@chat)
+      end
     end
 
     def complete(&on_event)
@@ -120,6 +136,17 @@ module Rubycog
       emit(:text_end, nil) if @stream_open
       emit(:status, @chat.awaiting_approval? ? 'waiting for approval' : 'ready')
       persist
+    end
+
+    # Compaction runs before a user turn, never in the middle of a tool round,
+    # and a failed summary must not cost the user their question.
+    def auto_compact
+      return unless @chat.respond_to?(:messages) && @compactor.needed?(@chat.messages)
+
+      emit(:status, 'compacting context')
+      @compactor.compact(@chat)
+    rescue StandardError => e
+      emit(:error, "compaction skipped: #{e.class}: #{e.message}")
     end
 
     # Saves the conversation after every step so a crash loses at most one reply.

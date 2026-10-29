@@ -230,7 +230,38 @@ end
     tui.send(:submit)
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/gc'
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/session'
+    assert_includes tui.instance_variable_get(:@entries).last[:text], '/compact'
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/restart'
+  end
+
+  def test_compact_command_runs_on_the_worker_thread
+    tui = Rubycog::TUI.new(compacting_agent(FakeChat.new, 'a summary'))
+    tui.instance_variable_set(:@input, +'/compact')
+    tui.send(:submit)
+    tui.instance_variable_get(:@worker).join(2)
+    tui.send(:drain_events)
+
+    assert_includes tui.instance_variable_get(:@entries).last[:text], 'Compacted the earlier turns'
+    refute tui.instance_variable_get(:@busy)
+  end
+
+  def test_compact_command_waits_for_the_current_step
+    chat = FakeChat.new
+    chat.define_singleton_method(:complete?) { false }
+    tui = Rubycog::TUI.new(compacting_agent(chat, 'a summary'))
+    tui.instance_variable_set(:@input, +'/compact')
+    tui.send(:submit)
+
+    assert_includes tui.instance_variable_get(:@entries).last[:text], 'Finish the current step'
+    refute tui.instance_variable_get(:@busy)
+  end
+
+  # Minimal agent double: a chat, and a compact that returns a fixed summary.
+  def compacting_agent(chat, summary)
+    agent = Object.new
+    agent.define_singleton_method(:chat) { chat }
+    agent.define_singleton_method(:compact) { |&_block| summary }
+    agent
   end
 
   def test_session_command_reports_path_and_turns

@@ -12,7 +12,7 @@ require_relative 'session'
 module Rubycog
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
-    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit"
+    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit"
     STATS_INTERVAL = 2.0
 
     def initialize(agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: ARGV)
@@ -199,6 +199,14 @@ module Rubycog
         @entries << { role: :info, text: HELP }
       when '/session'
         @entries << { role: :info, text: session_report }
+      when '/compact'
+        if @agent.chat.complete?
+          @busy = true
+          @status = 'compacting'
+          @worker = Thread.new { compact_conversation }
+        else
+          @entries << { role: :info, text: 'Finish the current step before compacting.' }
+        end
       when '/self'
         text = @self_iteration ? @self_iteration.to_text : 'self-iteration: not configured'
         @entries << { role: :info, text: text }
@@ -238,6 +246,22 @@ module Rubycog
       @events << { type: :done, payload: nil }
     end
 
+    def compact_conversation
+      summary = @agent.compact { |event| @events << event }
+      text = if summary
+               "Compacted the earlier turns into a #{summary.length}-character summary."
+             else
+               'Nothing to compact yet: the history is short, or a step is still open.'
+             end
+      @events << { type: :info, payload: text }
+    rescue Interrupt
+      raise
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      @events << { type: :error, payload: "#{e.class}: #{e.message}" }
+    ensure
+      @events << { type: :done, payload: nil }
+    end
+
     def resolve_approval(call)
       if @yolo
         @events << { type: :auto_approval, payload: nil }
@@ -267,6 +291,7 @@ module Rubycog
           @shown_code = nil
           @entries << { role: :result, text: payload.to_s }
         when :status then @status = payload
+        when :info then @entries << { role: :info, text: payload.to_s }
         when :error
           @entries << { role: :error, text: payload }
           @status = 'ready'

@@ -2,6 +2,7 @@
 
 require 'fileutils'
 require 'json'
+require 'ruby_llm'
 require 'time'
 
 module Rubycog
@@ -99,6 +100,91 @@ module Rubycog
       File.rename(tmp, path)
     rescue SystemCallError
       nil
+    end
+  end
+
+  # Shrinks a long conversation into a short model-written briefing, so later
+  # turns keep the thread without resending every earlier token.
+  #
+  # It works on the plain user/assistant turns that Session already extracts:
+  # raw tool output is exactly what a summary should drop. The system prompt is
+  # kept verbatim, and so are the newest turns, because the task in flight needs
+  # its exact wording more than any summary of it.
+  class Compactor
+    KEEP_TURNS = 6
+    MAX_TURNS = 40
+    MAX_CHARS = 60_000
+
+    PROMPT = <<~TEXT.freeze
+      Summarize the conversation transcript below so your future self can carry
+      on the work. Keep the user's goals and constraints, decisions and their
+      reasons, files and commands touched, what was verified, and what is still
+      open. Drop pleasantries, raw tool output, and anything that can simply be
+      re-read from the repository. Reply with the summary only, as short
+      bullets, in at most 300 words.
+    TEXT
+
+    def initialize(model: nil)
+      @model = model
+    end
+
+    # True once resending the transcript costs more than one summary call.
+    # Tool output counts toward the size: it is never summarized, but it is the
+    # most common reason a step no longer fits. The system prompt is ignored
+    # because compaction keeps it either way.
+    def needed?(messages)
+      list = Array(messages)
+      size = list.reject { |message| Session.field(message, :role).to_s == 'system' }
+                 .sum { |message| Session.field(message, :content).to_s.length }
+      Session.extract(list).length > MAX_TURNS || size > MAX_CHARS
+    end
+
+    # Rewrites the history as: system prompt, briefing, newest turns.
+    # Returns the summary text, or nil when the history is short enough to keep.
+    def compact(chat)
+      turns = Session.extract(chat.messages)
+      older = turns[0...-KEEP_TURNS]
+      return nil if older.length < 2
+
+      summary = summarize(older)
+      return nil unless summary
+
+      chat.messages = system_messages(chat.messages) + rebuilt(turns, summary)
+      summary
+    end
+
+    def summarize(turns)
+      prompt = "#{PROMPT}\n\n--- transcript ---\n#{transcript(turns)}"
+      text = RubyLLM.chat(model: @model).ask(prompt).content.to_s.strip
+      text.empty? ? nil : text
+    end
+
+    def transcript(turns)
+      turns.map { |turn| "#{turn['role']}: #{turn['content']}" }.join("\n\n")
+    end
+
+    def briefing(summary)
+      "Compacted summary of the earlier conversation:\n\n#{summary}"
+    end
+
+    private
+
+    def system_messages(messages)
+      Array(messages).select { |message| Session.field(message, :role).to_s == 'system' }
+    end
+
+    def tail(turns)
+      turns.last(KEEP_TURNS).map { |turn| { role: turn['role'], content: turn['content'] } }
+    end
+
+    # The briefing joins the first kept user turn when there is one, so the
+    # history still alternates instead of ending on two user turns in a row.
+    def rebuilt(turns, summary)
+      kept = tail(turns)
+      return [{ role: 'user', content: briefing(summary) }] + kept unless kept.first&.fetch(:role) == 'user'
+
+      kept[0] = { role: 'user', content: "#{briefing(summary)}\n\n#{kept.first[:content]}" }
+      kept
     end
   end
 end

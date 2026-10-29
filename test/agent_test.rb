@@ -56,6 +56,10 @@ class FakeChat
     @messages << { role: role.to_s, content: content }
   end
 
+  def messages=(new_messages)
+    @messages = new_messages
+  end
+
   def ask(question)
     @questions << question
     @messages << { role: 'user', content: question }
@@ -192,5 +196,57 @@ class AgentTest < Minitest::Test
     end
 
     assert_equal %w[eval read_source edit_source run_tests], chat.tool_names
+  end
+
+  def test_compacts_a_long_history_before_asking_and_persists_the_summary
+    dir = Dir.mktmpdir
+    path = File.join(dir, 'session.json')
+    long = Array.new(50) { |i| { role: i.even? ? 'user' : 'assistant', content: "turn #{i}" } }
+    chat = FakeChat.new(messages: long)
+    summarizer = AgentSummarizer.new('we did things')
+    events = []
+    agent = Rubycog::Agent.new(chat: chat, session: Rubycog::Session.new(path))
+
+    RubyLLM.stub(:chat, summarizer) { agent.ask('next') { |event| events << event } }
+
+    assert_equal ['next'], chat.questions
+    assert(events.any? { |event| event[:type] == :status && event[:payload] == 'compacting context' })
+    assert_includes chat.messages.first[:content], 'we did things'
+    assert_equal Rubycog::Compactor::KEEP_TURNS + 2, chat.messages.size
+    stored = Rubycog::Session.new(path).messages
+    assert_includes stored.first['content'], 'we did things'
+    refute(stored.any? { |message| message['content'] == 'turn 0' })
+  ensure
+    FileUtils.remove_entry(dir)
+  end
+
+  def test_manual_compact_leaves_a_short_history_alone
+    chat = FakeChat.new(messages: [{ role: 'user', content: 'hi' }])
+    agent = Rubycog::Agent.new(chat: chat)
+
+    assert_nil agent.compact
+    assert_equal [{ role: 'user', content: 'hi' }], chat.messages
+  end
+
+  def test_compact_waits_for_an_open_tool_round
+    chat = FakeChat.new
+    agent = Rubycog::Agent.new(chat: chat)
+    agent.ask('calculate')
+
+    assert chat.awaiting_approval?
+    assert_nil agent.compact
+  end
+end
+
+# Returns a fixed summary so compaction runs without a network call.
+class AgentSummarizer
+  Response = Data.define(:content)
+
+  def initialize(text)
+    @text = text
+  end
+
+  def ask(_prompt)
+    Response.new(content: @text)
   end
 end
