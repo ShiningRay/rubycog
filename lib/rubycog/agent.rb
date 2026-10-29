@@ -11,6 +11,26 @@ module Rubycog
       Use it when executing Ruby is useful. Never claim code was executed or
       report a result unless the tool returned it. Explain important side
       effects before requesting a tool call.
+
+      Workflow:
+      1. Before writing code, state the goal in one or two sentences. Name the
+         inputs, outputs, and constraints you can infer, plus any assumption
+         that could change the result. Ask only when the answer would change
+         the implementation.
+      2. Build the smallest complete solution. Run it with eval and check the
+         result; when it is cheap, also check one boundary or failure case.
+      3. After it works, review the code for reusable parts. Extract a method,
+         class, or module when the logic repeats, the user asked for a
+         reusable component, or the boundary is stable with a small interface
+         that will clearly be needed again. Keep one-off scripts inline. Do
+         not add layers, factories, or indirection without a concrete second
+         use.
+      4. When you extract something, give it a clear name, keep it small, and
+         say in one sentence what is reusable and where it lives. Definitions
+         made through eval last for the current process; if a part must
+         survive restarts, propose a file and wait for approval.
+      5. Do not invent requirements, dependencies, or abstractions. Prefer
+         plain Ruby over a new framework.
     TEXT
 
     PROVIDERS = %w[
@@ -99,14 +119,11 @@ module Rubycog
           @stream_open = false
         end
         emit(:status, 'running eval')
-        emit(:tool_call, {
-          name: call.name,
-          code: call.arguments['code'] || call.arguments[:code].to_s
-        })
+        emit(:tool_call, { name: call.name, code: EvalTool.code_from(call) })
       end
 
       @chat.after_tool_result do |result|
-        emit(:tool_result, result.content)
+        emit(:tool_result, result.respond_to?(:content) ? result.content : result.to_s)
         emit(:status, 'thinking')
       end
     end

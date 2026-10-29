@@ -3,7 +3,8 @@
 require 'ruby_llm'
 
 module Rubycog
-  # Deliberately executes unrestricted Ruby. The UI asks before every call.
+  # Deliberately executes unrestricted Ruby. The UI asks before every call
+  # unless yolo mode is enabled.
   class EvalTool < RubyLLM::Tool
     def self.tool_name = 'eval'
 
@@ -17,7 +18,13 @@ module Rubycog
     parameter :code, type: :string,
       description: 'Complete Ruby source code to evaluate'
 
-    requires_approval
+requires_approval
+
+# The model's JSON arguments arrive with String keys; accept Symbols too.
+def self.code_from(call)
+  arguments = call.arguments
+  (arguments['code'] || arguments[:code]).to_s
+end
 
     def initialize(binding: TOPLEVEL_BINDING.dup)
       super()

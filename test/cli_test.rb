@@ -2,12 +2,14 @@
 
 require_relative 'test_helper'
 require 'stringio'
+require 'minitest/mock'
 
 class CLITest < Minitest::Test
   def test_help
     output = StringIO.new
     assert_equal 0, Rubycog::CLI.start(['--help'], stdout: output)
     assert_includes output.string, '--model MODEL'
+    assert_includes output.string, '--yolo'
   end
 
   def test_invalid_option
@@ -33,5 +35,31 @@ class CLITest < Minitest::Test
     assert_equal 'test-key', config.openai_api_key
     assert_equal 'http://localhost:11434', config.ollama_api_base
     assert_equal 'test-model', config.default_model
+  end
+
+  def test_yolo_flag_reaches_the_tui
+    captured = nil
+    tui = Object.new
+    tui.define_singleton_method(:run) {}
+
+    Rubycog::Agent.stub(:new, ->(**_options) { Object.new }) do
+      Rubycog::TUI.stub(:new, ->(_agent, yolo: false) { captured = yolo; tui }) do
+        assert_equal 0, Rubycog::CLI.start(['--yolo'])
+      end
+    end
+    assert_equal true, captured
+  end
+
+  def test_yolo_is_off_by_default
+    captured = nil
+    tui = Object.new
+    tui.define_singleton_method(:run) {}
+
+    Rubycog::Agent.stub(:new, ->(**_options) { Object.new }) do
+      Rubycog::TUI.stub(:new, ->(_agent, yolo: false) { captured = yolo; tui }) do
+        assert_equal 0, Rubycog::CLI.start([])
+      end
+    end
+    assert_equal false, captured
   end
 end

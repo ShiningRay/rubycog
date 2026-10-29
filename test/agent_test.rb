@@ -16,7 +16,7 @@ class FakeChat
   Response = Data.define(:content)
   ToolCall = Data.define(:id, :name, :arguments)
 
-  attr_reader :model, :questions, :steps
+  attr_reader :model, :questions, :steps, :instructions
 
   def initialize
     @model = FakeModel.new
@@ -33,7 +33,11 @@ class FakeChat
     self
   end
 
-  def with_instructions(_instructions) = self
+  def with_instructions(instructions)
+    @instructions = instructions
+    self
+  end
+
   def with_tools(_tool) = self
 
   def after_tool_result(&block)
@@ -58,7 +62,8 @@ class FakeChat
   def complete
     @steps += 1
     @callbacks[:before].each { |callback| callback.call(@call) }
-    result = Struct.new(:content).new(@tool.execute(code: @call.arguments['code']))
+    # RubyLLM 2.1 passes the raw tool return value to after_tool_result.
+    result = @tool.execute(code: @call.arguments['code'])
     @callbacks[:after].each { |callback| callback.call(result) }
     yield Chunk.new(content: 'The answer is 42.')
     Response.new(content: 'The answer is 42.')
@@ -94,5 +99,34 @@ class AgentTest < Minitest::Test
     agent.ask('calculate')
     agent.resolve(chat.pending_approvals.first, false)
     refute chat.awaiting_approval?
+  end
+
+  def test_reset_keeps_the_eval_context
+    tool = Rubycog::EvalTool.new
+    agent = Rubycog::Agent.new(chat: FakeChat.new, tool: tool)
+    tool.execute(code: 'reuse_marker = 21')
+    RubyLLM.stub(:chat, FakeChat.new) { agent.reset }
+
+    assert_same tool, agent.instance_variable_get(:@tool)
+    assert_equal '42', tool.execute(code: 'reuse_marker * 2')
+  end
+
+  def test_default_chat_receives_the_coding_workflow_instructions
+    chat = FakeChat.new
+    RubyLLM.stub(:chat, ->(**_options) { chat }) do
+      Rubycog::Agent.new
+    end
+
+    assert_equal Rubycog::Agent::INSTRUCTIONS, chat.instructions
+  end
+
+  def test_instructions_require_requirement_analysis_and_reuse_review
+    instructions = Rubycog::Agent::INSTRUCTIONS
+
+    assert_includes instructions, 'Before writing code'
+    assert_includes instructions, 'review the code for reusable parts'
+    assert_includes instructions, 'Keep one-off scripts inline'
+    assert_includes instructions, 'add layers, factories'
+    assert_includes instructions, 'survive restarts'
   end
 end
