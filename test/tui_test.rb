@@ -161,6 +161,28 @@ class TUITest < Minitest::Test
     refute_includes window.rows[7], 'obj'
   end
 
+  def test_drawing_the_footer_never_samples_stats
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.define_singleton_method(:stats_snapshot) { flunk 'drawing must not fork for stats' }
+    tui.instance_variable_set(:@objects, 4242)
+    tui.instance_variable_set(:@memory, 2 * 1024 * 1024)
+    window = FakeWindow.new(10, 160)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_footer, 10, 160)
+
+    assert_includes window.rows[7], 'obj 4,242'
+  end
+
+  def test_sample_stats_refreshes_values_and_requests_a_repaint
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.define_singleton_method(:stats_snapshot) { { objects: 4242, memory: 2 * 1024 * 1024 } }
+    tui.send(:sample_stats)
+
+    assert_equal 4242, tui.instance_variable_get(:@objects)
+    assert_equal 1, tui.instance_variable_get(:@events).size
+    assert_equal 1, tui.send(:drain_events)
+  end
+
   def test_gc_command_reports_freed_objects_and_memory
     tui = Rubycog::TUI.new(FakeChat.new)
     snapshots = [{ objects: 100_000, memory: 64 * 1024 * 1024 },
@@ -264,6 +286,62 @@ end
     agent
   end
 
+  def test_draws_fenced_code_indented_and_without_fences
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_get(:@entries) << { role: :assistant,
+                                              text: "## Plan\nTry this:\n```ruby\nx = 1\n```\ndone" }
+    window = FakeWindow.new(20, 60)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_transcript, 20, 60)
+    drawn = window.rows.join("\n")
+
+    assert_includes drawn, '    x = 1'
+    assert_includes drawn, 'Try this:'
+    assert_includes drawn, 'Plan'
+    refute_includes drawn, '```'
+    refute_includes drawn, '##'
+  end
+
+  def test_tool_entries_are_drawn_as_code
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_get(:@entries) << { role: :tool, text: "a = 1\nb = 2" }
+    window = FakeWindow.new(20, 60)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_transcript, 20, 60)
+
+    assert_includes window.rows.join("\n"), '    b = 2'
+  end
+
+  def test_transcript_rows_are_cached_until_the_text_changes
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entry = { role: :assistant, text: +'hello there' }
+    first = tui.send(:body_rows, entry, 60)
+    assert_same first, tui.send(:body_rows, entry, 60)
+
+    entry[:text] << ' again'
+    refute_same first, tui.send(:body_rows, entry, 60)
+  end
+
+  def test_cached_rows_are_rebuilt_when_the_width_changes
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entry = { role: :assistant, text: 'word ' * 40 }
+    wide = tui.send(:body_rows, entry, 60)
+    narrow = tui.send(:body_rows, entry, 30)
+
+    refute_same wide, narrow
+    assert_operator narrow.length, :>, wide.length
+  end
+
+  def test_drain_events_reports_how_many_events_were_handled
+    tui = Rubycog::TUI.new(FakeChat.new)
+    assert_equal 0, tui.send(:drain_events)
+
+    events = tui.instance_variable_get(:@events)
+    events << { type: :text, payload: 'hi' }
+    events << { type: :text_end, payload: nil }
+    assert_equal 2, tui.send(:drain_events)
+  end
+
   def test_session_command_reports_path_and_turns
     session = Rubycog::Session.new('/tmp/rubycog-test-session.json')
     session.define_singleton_method(:messages) { [{ 'role' => 'user', 'content' => 'x' }] }
@@ -336,6 +414,25 @@ end
     tui.send(:refresh_stats)
     assert_operator tui.instance_variable_get(:@objects), :>, 0
     assert_operator tui.instance_variable_get(:@memory), :>, 0
+  end
+
+  def test_enter_returns_quit_for_quit_command
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@input, +'/quit')
+
+    assert_equal :quit, tui.send(:handle_key, 10)
+  end
+
+  def test_enter_returns_restart_for_restart_command
+    saved = []
+    session = Struct.new(:path).new('/tmp/session.json')
+    session.define_singleton_method(:save) { |messages| saved << messages }
+    chat = FakeChat.new
+    tui = Rubycog::TUI.new(Struct.new(:chat).new(chat), session: session)
+    tui.instance_variable_set(:@input, +'/restart')
+
+    assert_equal :restart, tui.send(:handle_key, 13)
+    assert_equal [chat.messages], saved
   end
 
   def test_self_command_reports_iteration_history

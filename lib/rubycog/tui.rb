@@ -14,6 +14,13 @@ module Rubycog
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
     HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit"
     STATS_INTERVAL = 2.0
+    CODE_COLOR = 5
+    STYLES = { code: [CODE_COLOR, 0], heading: [0, Curses::A_BOLD] }.freeze
+    LABELS = {
+      user: ['You', 1], assistant: ['RubyCog', 2], tool: ['eval', 3],
+      result: ['result', 3], error: ['Error', 4], warning: ['Warning', 3],
+      info: ['·', 0]
+    }.freeze
 
     def initialize(agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: ARGV)
       @agent = agent
@@ -61,16 +68,19 @@ module Rubycog
       @window.keypad = true
       @window.timeout = 50
       init_colors
+      start_stats_sampler
       draw
 
       action = nil
       loop do
         key = normalize_key(@window.getch)
-        drain_events
+        changed = drain_events.positive?
         action = handle_key(key)
         break if action == :quit || action == :restart
 
-        draw
+        # The 50ms read timeout wakes the loop even when nothing happened;
+        # redrawing then only burns CPU proportional to transcript size.
+        draw if key || changed
       end
     ensure
       if @busy
@@ -129,6 +139,7 @@ module Rubycog
       Curses.init_pair(2, Curses::COLOR_GREEN, -1)
       Curses.init_pair(3, Curses::COLOR_YELLOW, -1)
       Curses.init_pair(4, Curses::COLOR_RED, -1)
+      Curses.init_pair(CODE_COLOR, Curses::COLOR_MAGENTA, -1)
     end
 
     def normalize_key(key)
@@ -148,7 +159,7 @@ module Rubycog
       return if @busy
 
       case key
-      when 10, 13 then submit
+      when 10, 13 then return submit
       when 12 then draw
       when Curses::KEY_LEFT then @cursor = [@cursor - 1, 0].max
       when Curses::KEY_RIGHT then @cursor = [@cursor + 1, @input.length].min
@@ -279,9 +290,13 @@ module Rubycog
       @approval = nil
     end
 
+    # Returns how many events were handled so the loop can redraw only when
+    # the screen actually changed.
     def drain_events
+      handled = 0
       until @events.empty?
         event = @events.pop(true)
+        handled += 1
         payload = event[:payload]
         case event[:type]
         when :text then append_text(payload)
@@ -308,6 +323,7 @@ module Rubycog
           @streaming = false
         end
       end
+      handled
     end
 
     # Approval and the tool call both carry the code; show it once per call.
@@ -371,15 +387,37 @@ module Rubycog
 
     def draw_transcript(height, width)
       rows = @entries.flat_map do |entry|
-        label, color = labels.fetch(entry[:role])
+        label, color = LABELS.fetch(entry[:role])
         lines = [[label, color, Curses::A_BOLD]]
-        lines.concat(Text.wrap(entry[:text], width - 4).map { |line| ["  #{line}", 0, 0] })
+        lines.concat(body_rows(entry, width))
         lines << ['', 0, 0]
       end
       body_height = height - 5
       @scroll = [@scroll, [rows.length - body_height, 0].max].min
       visible = rows.last(body_height + @scroll).first(body_height)
       visible.each_with_index { |(text, color, attribute), i| put(i + 2, 1, text, width - 2, color, attribute) }
+    end
+
+    # Wrapping is linear in text length, so re-laying out every turn on each
+    # keystroke made long sessions feel sluggish. Rows are kept per entry and
+    # reused until the text or the width changes; the text is copied because
+    # streaming appends to the same String in place.
+    def body_rows(entry, width)
+      body = width - 4
+      cached = entry[:layout]
+      return cached[:rows] if cached && cached[:width] == body && cached[:text] == entry[:text]
+
+      styled = if entry[:role] == :tool
+                 Markdown.code_lines(entry[:text], body)
+               else
+                 Markdown.lines(entry[:text], body)
+               end
+      rows = styled.map do |line, style|
+        color, attribute = STYLES.fetch(style, [0, 0])
+        ["  #{line}", color, attribute]
+      end
+      entry[:layout] = { width: body, text: entry[:text].dup, rows: rows }
+      rows
     end
 
     def draw_footer(height, width)
@@ -399,7 +437,6 @@ module Rubycog
     end
 
     def draw_stats(height, width, left_width)
-      refresh_stats
       text = stats_text
       return if text.empty?
 
@@ -419,6 +456,30 @@ module Rubycog
       { objects: GC.stat(:heap_live_slots), memory: memory_bytes }
     rescue StandardError
       { objects: nil, memory: nil }
+    end
+
+    # Sampling RSS forks `ps`, which measures ~90ms here and over a second when
+    # the machine is loaded (exactly when tool runs keep it busy). On the draw
+    # path that froze key handling for that long, so keys looked ignored.
+    # Sample in the background and let the footer render the last sample.
+    def sample_stats
+      refresh_stats(force: true)
+      # Unhandled event types are a no-op for drain_events yet still count as a
+      # change, which repaints the footer while the UI is otherwise idle.
+      @events << { type: :stats, payload: nil }
+    end
+
+    def start_stats_sampler
+      @stats_thread = Thread.new do
+        loop do
+          begin
+            sample_stats
+          rescue StandardError
+            # Stats are cosmetic; keep sampling rather than dying.
+          end
+          sleep STATS_INTERVAL
+        end
+      end
     end
 
     def refresh_stats(force: false)
@@ -494,14 +555,6 @@ module Rubycog
       Curses.curs_set(@busy ? 0 : 1)
       cursor = prompt.length + Text.width(@input[0...@cursor]) - offset
       @window.setpos(height - 1, [cursor, width - 1].min)
-    end
-
-    def labels
-      {
-        user: ['You', 1], assistant: ['RubyCog', 2], tool: ['eval', 3],
-        result: ['result', 3], error: ['Error', 4], warning: ['Warning', 3],
-        info: ['·', 0]
-      }
     end
 
     def put(y, x, text, max_width, color = 0, attribute = 0)
