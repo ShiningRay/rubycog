@@ -43,7 +43,7 @@ class CLITest < Minitest::Test
     tui.define_singleton_method(:run) {}
 
     Rubycog::Agent.stub(:new, ->(**_options) { Object.new }) do
-      Rubycog::TUI.stub(:new, ->(_agent, yolo: false) { captured = yolo; tui }) do
+      Rubycog::TUI.stub(:new, ->(_agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: []) { captured = yolo; tui }) do
         assert_equal 0, Rubycog::CLI.start(['--yolo'])
       end
     end
@@ -56,7 +56,7 @@ class CLITest < Minitest::Test
     tui.define_singleton_method(:run) {}
 
     Rubycog::Agent.stub(:new, ->(**_options) { Object.new }) do
-      Rubycog::TUI.stub(:new, ->(_agent, yolo: false) { captured = yolo; tui }) do
+      Rubycog::TUI.stub(:new, ->(_agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: []) { captured = yolo; tui }) do
         assert_equal 0, Rubycog::CLI.start([])
       end
     end

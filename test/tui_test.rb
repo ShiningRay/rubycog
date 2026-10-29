@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
+require 'tmpdir'
 
 class FakeWindow
   attr_reader :rows, :cursor
@@ -99,7 +100,7 @@ class TUITest < Minitest::Test
     assert tui.instance_variable_get(:@approvals).empty?
     tui.send(:drain_events)
     assert_includes tui.instance_variable_get(:@entries).map { |entry| entry[:text] },
-      'eval auto-approved (yolo)'
+      'tool auto-approved (yolo)'
   end
 
   def test_yolo_starts_with_a_warning
@@ -228,6 +229,75 @@ end
     tui.instance_variable_set(:@input, +'/help')
     tui.send(:submit)
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/gc'
+    assert_includes tui.instance_variable_get(:@entries).last[:text], '/session'
+    assert_includes tui.instance_variable_get(:@entries).last[:text], '/restart'
+  end
+
+  def test_session_command_reports_path_and_turns
+    session = Rubycog::Session.new('/tmp/rubycog-test-session.json')
+    session.define_singleton_method(:messages) { [{ 'role' => 'user', 'content' => 'x' }] }
+    tui = Rubycog::TUI.new(FakeChat.new, session: session)
+    tui.instance_variable_set(:@input, +'/session')
+    tui.send(:submit)
+
+    text = tui.instance_variable_get(:@entries).last[:text]
+    assert_includes text, '/tmp/rubycog-test-session.json'
+    assert_includes text, '1 turns'
+  end
+
+  def test_shows_resumed_session_count_and_path
+    session = Struct.new(:path).new('/tmp/session.json')
+    tui = Rubycog::TUI.new(FakeChat.new, history: [{ 'role' => 'user', 'content' => 'old' }],
+                                         session: session)
+    entries = tui.instance_variable_get(:@entries)
+
+    assert_equal 'old', entries[1][:text]
+    assert_equal 'Resumed 1 turns from /tmp/session.json', entries[2][:text]
+    assert_equal 'resumed 1 turns', tui.instance_variable_get(:@status)
+  end
+
+  def test_shows_new_session_path
+    session = Struct.new(:path).new('/tmp/session.json')
+    tui = Rubycog::TUI.new(FakeChat.new, session: session)
+
+    assert_includes tui.instance_variable_get(:@entries).map { |entry| entry[:text] },
+      'New session: /tmp/session.json'
+    assert_equal 'new session', tui.instance_variable_get(:@status)
+  end
+
+  def test_restart_saves_the_session_and_returns_restart
+    saved = []
+    session = Object.new
+    session.define_singleton_method(:path) { '/tmp/session.json' }
+    session.define_singleton_method(:save) { |messages| saved << messages }
+    chat = FakeChat.new
+    agent = Struct.new(:chat).new(chat)
+    tui = Rubycog::TUI.new(agent, session: session)
+    tui.instance_variable_set(:@input, +'/restart')
+
+    assert_equal :restart, tui.send(:submit)
+    assert_equal [chat.messages], saved
+  end
+
+  def test_footer_marks_code_changes_as_needing_restart
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@source_stale, true)
+    tui.instance_variable_set(:@stats_at, Process.clock_gettime(Process::CLOCK_MONOTONIC))
+    window = FakeWindow.new(10, 120)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_footer, 10, 120)
+
+    assert_includes window.rows[7], '/restart'
+  end
+
+  def test_detects_source_changes
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@source_digest, { 'a' => [1, 1] })
+    tui.define_singleton_method(:source_snapshot) { { 'a' => [2, 1] } }
+
+    tui.send(:refresh_source_state)
+
+    assert tui.instance_variable_get(:@source_stale)
   end
 
   def test_refresh_stats_collects_runtime_values
@@ -235,5 +305,38 @@ end
     tui.send(:refresh_stats)
     assert_operator tui.instance_variable_get(:@objects), :>, 0
     assert_operator tui.instance_variable_get(:@memory), :>, 0
+  end
+
+  def test_self_command_reports_iteration_history
+    dir = Dir.mktmpdir('rubycog-tui-self')
+    iteration = Rubycog::SelfIteration.new(path: File.join(dir, 'self.json'))
+    iteration.record_edit(path: 'lib/rubycog/agent.rb', reason: 'fix', ok: true)
+    tui = Rubycog::TUI.new(FakeChat.new, self_iteration: iteration)
+    tui.instance_variable_set(:@input, +'/self')
+    tui.send(:submit)
+
+    assert_includes tui.instance_variable_get(:@entries).last[:text], 'lib/rubycog/agent.rb'
+  ensure
+    FileUtils.remove_entry(dir)
+  end
+
+  def test_footer_names_the_pending_tool
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@approval, Struct.new(:name).new('edit_source'))
+    window = FakeWindow.new(10, 120)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_footer, 10, 120)
+
+    assert_includes window.rows[7], 'Run edit_source?'
+  end
+
+  def test_tool_preview_describes_edit_and_test_calls
+    edit = Struct.new(:name, :arguments).new('edit_source',
+                                             { 'path' => 'lib/rubycog/agent.rb', 'reason' => 'fix' })
+    tests = Struct.new(:name, :arguments).new('run_tests', { 'paths' => 'test/agent_test.rb' })
+
+    assert_includes Rubycog::ToolPreview.for(edit), 'edit lib/rubycog/agent.rb'
+    assert_includes Rubycog::ToolPreview.for(edit), 'fix'
+    assert_includes Rubycog::ToolPreview.for(tests), 'test/agent_test.rb'
   end
 end

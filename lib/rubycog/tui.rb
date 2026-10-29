@@ -2,34 +2,52 @@
 
 require 'curses'
 require 'io/console'
+require 'rbconfig'
 require_relative 'text'
 require_relative 'eval_tool'
+require_relative 'tool_preview'
+require_relative 'self_iteration'
+require_relative 'session'
 
 module Rubycog
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
-    HELP = "/help  this help\n/yolo  toggle automatic eval approval\n/gc    free VM memory (run GC)\n/clear  new conversation\n/quit   exit"
+    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit"
     STATS_INTERVAL = 2.0
 
-    def initialize(agent, yolo: false)
+    def initialize(agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: ARGV)
       @agent = agent
+      @session = session
+      @self_iteration = self_iteration
+      @argv = argv.dup
       @events = Queue.new
       @approvals = Queue.new
+      turns = history_entries(history)
       @entries = [{ role: :info, text: WELCOME }]
-      @entries << { role: :warning, text: 'YOLO: eval runs without approval.' } if yolo
+      @entries.concat(turns)
+      @entries << { role: :info, text: session_status(turns.size) } if session
+      @entries << { role: :warning, text: 'YOLO: all tools run without approval.' } if yolo
       @input = +''
       @cursor = 0
       @bytes = +''.b
       @busy = false
       @approval = nil
       @scroll = 0
-      @status = 'ready'
+      @status = if !session
+                  'ready'
+                elsif turns.empty?
+                  'new session'
+                else
+                  "resumed #{turns.size} turns"
+                end
       @streaming = false
       @yolo = yolo
       @objects = nil
       @memory = nil
       @stats_at = nil
       @shown_code = nil
+      @source_digest = source_snapshot
+      @source_stale = false
     end
 
     def run
@@ -45,10 +63,12 @@ module Rubycog
       init_colors
       draw
 
+      action = nil
       loop do
         key = normalize_key(@window.getch)
         drain_events
-        break if handle_key(key) == :quit
+        action = handle_key(key)
+        break if action == :quit || action == :restart
 
         draw
       end
@@ -58,9 +78,49 @@ module Rubycog
         @worker&.join(1)
       end
       Curses.close_screen
+      exec(RbConfig.ruby, $PROGRAM_NAME, *@argv) if action == :restart
     end
 
     private
+
+    def session_status(count)
+      return '' unless @session&.path
+
+      count.positive? ? "Resumed #{count} turns from #{@session.path}" : "New session: #{@session.path}"
+    end
+
+    def session_report
+      return 'session: none' unless @session
+
+      count = @session.respond_to?(:messages) ? @session.messages.size : 0
+      "#{@session.path} · #{count} turns"
+    end
+
+    # Prior turns are shown under the welcome banner after a restart.
+    def history_entries(history)
+      Session.extract(history).map { |message| { role: message['role'].to_sym, text: message['content'] } }
+    end
+
+    # Self-edits change files on disk; the running process keeps the old
+    # classes. Track the snapshot so the footer can ask for a restart.
+    def source_snapshot
+      paths = Dir[File.join(Rubycog.root, 'lib', '**', '*.rb')]
+      paths += [File.join(Rubycog.root, 'Gemfile'), File.join(Rubycog.root, 'bin', 'rubycog')]
+      paths.sort.each_with_object({}) do |path, snapshot|
+        next unless File.file?(path)
+
+        stat = File.stat(path)
+        snapshot[path] = [stat.mtime.to_f, stat.size]
+      end
+    rescue SystemCallError
+      {}
+    end
+
+    def refresh_source_state
+      @source_stale = source_snapshot != @source_digest
+    rescue StandardError
+      @source_stale = false
+    end
 
     def init_colors
       return unless Curses.has_colors?
@@ -125,21 +185,28 @@ module Rubycog
 
       case message
       when '/quit', '/exit' then return :quit
+      when '/restart'
+        return :restart if save_session
       when '/clear'
         if @agent.chat.complete?
           @agent.reset
           @entries = [{ role: :info, text: 'New conversation.' }]
-          @entries << { role: :warning, text: 'YOLO: eval runs without approval.' } if @yolo
+          @entries << { role: :warning, text: 'YOLO: all tools run without approval.' } if @yolo
         else
           @entries << { role: :info, text: 'Finish the current step before clearing.' }
         end
       when '/help'
         @entries << { role: :info, text: HELP }
+      when '/session'
+        @entries << { role: :info, text: session_report }
+      when '/self'
+        text = @self_iteration ? @self_iteration.to_text : 'self-iteration: not configured'
+        @entries << { role: :info, text: text }
       when '/gc' then collect_garbage
       when '/yolo'
         @yolo = !@yolo
         if @yolo
-          @entries << { role: :warning, text: 'YOLO on: eval runs without approval.' }
+          @entries << { role: :warning, text: 'YOLO on: all tools run without approval.' }
         else
           @entries << { role: :info, text: 'YOLO off: eval requires approval.' }
         end
@@ -163,7 +230,9 @@ module Rubycog
         @agent.resolve(call, approved)
         response = @agent.complete { |event| @events << event }
       end
-    rescue StandardError => e
+    rescue Interrupt
+      raise
+    rescue Exception => e # rubocop:disable Lint/RescueException
       @events << { type: :error, payload: "#{e.class}: #{e.message}" }
     ensure
       @events << { type: :done, payload: nil }
@@ -203,9 +272,9 @@ module Rubycog
           @status = 'ready'
         when :approval
           @approval = payload
-          show_code(EvalTool.code_from(payload))
+          show_code(ToolPreview.for(payload))
         when :auto_approval
-          @entries << { role: :info, text: 'eval auto-approved (yolo)' }
+          @entries << { role: :info, text: 'tool auto-approved (yolo)' }
         when :approval_decision
           @entries << { role: :info, text: payload ? 'eval approved' : 'eval denied' }
         when :done
@@ -291,7 +360,9 @@ module Rubycog
     def draw_footer(height, width)
       mode = @yolo ? '  ·  YOLO' : ''
       text = if @approval
-               'Run eval? [y] approve once  [n] deny'
+               "Run #{@approval.name}? [y] approve once  [n] deny"
+             elsif @source_stale
+               'code changed — /restart to apply'
              elsif @busy
                "#{@status}#{mode}  ·  Ctrl-C cancel"
              else
@@ -330,9 +401,20 @@ module Rubycog
       return if !force && @stats_at && now - @stats_at < STATS_INTERVAL
 
       @stats_at = now
+      refresh_source_state
       snapshot = stats_snapshot
       @objects = snapshot[:objects]
       @memory = snapshot[:memory]
+    end
+
+    def save_session
+      return true unless @session
+
+      @session.save(@agent.chat.messages)
+      true
+    rescue StandardError => e
+      @entries << { role: :error, text: "session save failed: #{e.class}: #{e.message}" }
+      false
     end
 
     def collect_garbage

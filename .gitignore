@@ -7,3 +7,5 @@ tmp/
 *.gem
 *.bak
 *.log
+.rubycog_session.json*
+.rubycog/

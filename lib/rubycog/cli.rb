@@ -5,14 +5,18 @@ require 'optparse'
 module Rubycog
   module CLI
     def self.start(argv, stdout: $stdout, stderr: $stderr)
+      original_argv = argv.dup
       options = { yolo: false }
       parser = OptionParser.new do |opts|
         opts.banner = 'Usage: rubycog [--model MODEL] [--yolo]'
         opts.on('-m', '--model MODEL', 'RubyLLM model ID (or RUBYCOG_MODEL)') do |model|
           options[:model] = model
         end
-        opts.on('-y', '--yolo', 'Run eval without asking for approval (dangerous)') do
+        opts.on('-y', '--yolo', 'Run tools without asking for approval (dangerous)') do
           options[:yolo] = true
+        end
+        opts.on('-s', '--session PATH', 'Conversation file (or RUBYCOG_SESSION)') do |path|
+          options[:session] = path
         end
         opts.on('-h', '--help', 'Show this help') do
           stdout.puts opts
@@ -26,7 +30,11 @@ module Rubycog
       parser.parse!(argv)
 
       Agent.configure
-      TUI.new(Agent.new(model: options[:model]), yolo: options[:yolo]).run
+      session = Session.new(options[:session] || Session.default_path)
+      iteration = SelfIteration.new
+      agent = Agent.new(model: options[:model], session: session, self_iteration: iteration)
+      TUI.new(agent, yolo: options[:yolo], history: session.messages, session: session,
+                     self_iteration: iteration, argv: original_argv).run
       0
     rescue OptionParser::ParseError => e
       stderr.puts "rubycog: #{e.message}"

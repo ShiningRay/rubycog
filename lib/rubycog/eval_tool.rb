@@ -18,23 +18,34 @@ module Rubycog
     parameter :code, type: :string,
       description: 'Complete Ruby source code to evaluate'
 
-requires_approval
+    requires_approval
 
-# The model's JSON arguments arrive with String keys; accept Symbols too.
-def self.code_from(call)
-  arguments = call.arguments
-  (arguments['code'] || arguments[:code]).to_s
-end
+    # The model's JSON arguments arrive with String keys; accept Symbols too.
+    def self.code_from(call)
+      arguments = call.arguments
+      (arguments['code'] || arguments[:code]).to_s
+    end
 
-    def initialize(binding: TOPLEVEL_BINDING.dup)
+    def initialize(binding: TOPLEVEL_BINDING.dup, base_dir: nil)
       super()
       @binding = binding
+      @base_dir = base_dir
     end
 
     def execute(code:)
-      @binding.eval(code).inspect
-    rescue StandardError, SyntaxError => e
+      @binding.eval(code, eval_file, 1).inspect
+    rescue Interrupt
+      raise
+    rescue Exception => e # rubocop:disable Lint/RescueException
       "#{e.class}: #{e.message}"
+    end
+
+    private
+
+    # A real filename gives require_relative a base path. With the default
+    # eval filename it raises "cannot infer basepath".
+    def eval_file
+      File.join(@base_dir || Dir.pwd, '(eval)')
     end
   end
 end

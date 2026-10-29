@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
+require 'tmpdir'
 
 class EvalToolTest < Minitest::Test
   def setup
@@ -29,5 +30,31 @@ class EvalToolTest < Minitest::Test
   def test_returns_runtime_and_syntax_errors_to_the_model
     assert_match(/\AZeroDivisionError: /, @tool.execute(code: '1 / 0'))
     assert_match(/\ASyntaxError: /, @tool.execute(code: 'def'))
+  end
+
+  def test_returns_load_errors_to_the_model
+    assert_match(/\ALoadError: /, @tool.execute(code: "require 'rubycog_missing_dependency'"))
+  end
+
+  def test_require_relative_resolves_from_the_given_base_dir
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, 'rubycog_eval_helper.rb'), 'RUBYCOG_EVAL_HELPER_LOADED = true')
+      tool = Rubycog::EvalTool.new(base_dir: dir)
+
+      assert_equal 'true',
+        tool.execute(code: "require_relative 'rubycog_eval_helper'; RUBYCOG_EVAL_HELPER_LOADED")
+    end
+  end
+
+  def test_missing_require_relative_is_returned_instead_of_escaping
+    assert_match(/\ALoadError: /, @tool.execute(code: "require_relative 'rubycog_missing_relative'"))
+  end
+
+  def test_exit_is_returned_instead_of_terminating_the_process
+    assert_match(/\ASystemExit: /, @tool.execute(code: 'exit 7'))
+  end
+
+  def test_interrupt_is_not_swallowed
+    assert_raises(Interrupt) { @tool.execute(code: 'raise Interrupt') }
   end
 end

@@ -2,6 +2,7 @@
 
 require_relative 'test_helper'
 require 'minitest/mock'
+require 'tmpdir'
 
 class FakeModel
   attr_reader :id
@@ -16,9 +17,10 @@ class FakeChat
   Response = Data.define(:content)
   ToolCall = Data.define(:id, :name, :arguments)
 
-  attr_reader :model, :questions, :steps, :instructions
+  attr_reader :model, :questions, :steps, :instructions, :messages, :tools
 
-  def initialize
+  def initialize(messages: [])
+    @messages = messages
     @model = FakeModel.new
     @questions = []
     @steps = 0
@@ -38,15 +40,26 @@ class FakeChat
     self
   end
 
-  def with_tools(_tool) = self
+  def with_tools(*tools)
+    @tools = tools
+    self
+  end
+
+  def tool_names = Array(@tools).map(&:name)
 
   def after_tool_result(&block)
     @callbacks[:after] << block
     self
   end
 
+  def add_message(role:, content:)
+    @messages << { role: role.to_s, content: content }
+  end
+
   def ask(question)
     @questions << question
+    @messages << { role: 'user', content: question }
+    @messages << { role: 'assistant', content: 'I will calculate it.' }
     yield Chunk.new(content: 'I will calculate it.')
     @pending = true
     Response.new(content: nil)
@@ -120,6 +133,38 @@ class AgentTest < Minitest::Test
     assert_equal Rubycog::Agent::INSTRUCTIONS, chat.instructions
   end
 
+  def test_restores_stored_turns_and_persists_each_step
+    dir = Dir.mktmpdir
+    path = File.join(dir, 'session.json')
+    Rubycog::Session.new(path).save([{ 'role' => 'user', 'content' => 'earlier question' },
+                                     { 'role' => 'assistant', 'content' => 'earlier answer' }])
+    chat = FakeChat.new
+
+    agent = Rubycog::Agent.new(chat: chat, session: Rubycog::Session.new(path))
+    assert_equal %w[user assistant], chat.messages.map { |m| m[:role] }
+
+    agent.ask('next question')
+    stored = Rubycog::Session.new(path).messages
+
+    assert_equal %w[earlier next], [stored.first['content'].split.first, stored[2]['content'].split.first]
+    assert_equal 4, stored.size
+  ensure
+    FileUtils.remove_entry(dir)
+  end
+
+  def test_reset_forgets_the_stored_conversation
+    dir = Dir.mktmpdir
+    path = File.join(dir, 'session.json')
+    Rubycog::Session.new(path).save([{ 'role' => 'user', 'content' => 'old' }])
+    agent = Rubycog::Agent.new(chat: FakeChat.new, session: Rubycog::Session.new(path))
+
+    RubyLLM.stub(:chat, FakeChat.new) { agent.reset }
+
+    refute File.exist?(path)
+  ensure
+    FileUtils.remove_entry(dir)
+  end
+
   def test_instructions_require_requirement_analysis_and_reuse_review
     instructions = Rubycog::Agent::INSTRUCTIONS
 
@@ -128,5 +173,24 @@ class AgentTest < Minitest::Test
     assert_includes instructions, 'Keep one-off scripts inline'
     assert_includes instructions, 'add layers, factories'
     assert_includes instructions, 'survive restarts'
+  end
+
+  def test_reports_load_errors_instead_of_escaping_the_worker
+    chat = FakeChat.new
+    chat.define_singleton_method(:ask) { |_message, &_block| raise LoadError, 'missing' }
+    agent = Rubycog::Agent.new(chat: chat)
+    events = []
+
+    assert_nil agent.ask('x') { |event| events << event }
+    assert_equal 'LoadError: missing', events.find { |event| event[:type] == :error }[:payload]
+  end
+
+  def test_default_agent_registers_the_self_iteration_tools
+    chat = FakeChat.new
+    RubyLLM.stub(:chat, ->(**_options) { chat }) do
+      Rubycog::Agent.new
+    end
+
+    assert_equal %w[eval read_source edit_source run_tests], chat.tool_names
   end
 end

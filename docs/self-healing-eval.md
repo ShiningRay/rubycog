@@ -16,9 +16,9 @@
 
 | 位置 | 现状 | 缺口 |
 | --- | --- | --- |
-| `lib/rubycog/eval_tool.rb:28-32` | `rescue StandardError, SyntaxError`，返回 `"类名: 消息"` | 无 backtrace、无出错行、无源码上下文；`SystemExit`/`SystemStackError`/`SignalException` 会打穿进程 |
-| `lib/rubycog/eval_tool.rb:29` | `@binding.eval(code)` 用默认文件名 `(eval)` | 多行代码定位到 `(eval):N` 但无代码片段；无法区分用户帧与框架帧 |
-| `lib/rubycog/agent.rb:82-84` | 只 `rescue StandardError` | 非 StandardError 会跳过事件流，TUI 停在 thinking |
+| `lib/rubycog/eval_tool.rb` | 2026-10-29 已扩为 `rescue Exception`（`Interrupt` 重抛），`LoadError`/`SystemExit`/栈溢出等回传为文本；成功路径仍返回 `"类名: 消息"` | 仍无 backtrace、出错行与源码上下文 |
+| `lib/rubycog/eval_tool.rb` | 2026-10-29 已给 eval 传入 `<cwd>/(eval)` 作为文件名与起始行 1 | `require_relative` 可用；用户帧显示绝对路径而非 `(eval)` |
+| `lib/rubycog/agent.rb` | 2026-10-29 已扩为 `rescue Exception`（`Interrupt` 重抛） | 非 StandardError 不再跳过事件流、打穿工作线程 |
 | `lib/rubycog/agent.rb:108-111` | `emit(:tool_result, result.content)` | **真实 RubyLLM 2.1.1 的 `after_tool_result` 回调收到的是工具原始返回值（String），`String#content` 不存在**。此处必然 `NoMethodError`，且异常发生在 `add_tool_result_message` 之前，工具结果不会写入对话，模型看不到 eval 输出。已于 2026-10-29 修复：回调改为 `result.respond_to?(:content) ? result.content : result.to_s`，测试替身也改为真实 String 形态 |
 | `lib/rubycog/agent.rb:8-14` | 指令只说明"用 eval、别谎称执行" | 无错误分诊协议，无框架/用户代码边界 |
 | `lib/rubycog/agent.rb:91` | 唯一工具是 `EvalTool` | 无只读源码、无受控编辑、无测试执行入口 |
@@ -134,17 +134,19 @@ v2 增强：强制先提交一个会失败的测试（失败测试先行），�
 
 ## 6. 自修执行层
 
+执行层与重启闭环的完整说明见 [self-iteration.md](self-iteration.md)；本节保留分诊视角的契约。
+
 ### 6.1 工具集
 
-保持"小工具、可审批"的风格，新增三个工具（`lib/rubycog/tools/`）：
+保持"小工具、可审批"的风格，已实现三个工具（`lib/rubycog/tools/`）：
 
-| 工具 | 参数 | 审批 | 说明 |
+| 工具 | 参数 | 审批 | 状态 |
 | --- | --- | --- | --- |
-| `read_source` | `path`, `start_line?`, `end_line?` | 否 | 只读，路径相对 `Rubycog.root`；默认返回前 200 行，拒绝二进制与超长文件 |
-| `edit_source` | `path`, `old_string`, `new_string`, `reason` | 是 | 唯一匹配替换；写前展示 unified diff；原子写 + 备份 |
-| `run_tests` | `paths`（测试文件数组，可选） | 是 | 子进程执行 `bundle exec ruby -Itest <paths>`，超时 120s，输出截断 4000 字符 |
+| `read_source` | `path`, `start_line?`, `end_line?` | 否 | 已实现：只读白名单，带行号；默认 200 行 / 20 KB |
+| `edit_source` | `path`, `old_string`, `new_string`, `reason` | 是 | 已实现：唯一匹配替换；备份 + 原子写 + `ruby -c`；失败回滚；结果含 unified diff |
+| `run_tests` | `paths`（逗号分隔，可选） | 是 | 已实现：`bundle exec ruby -Itest <paths>` 或全量 `bundle exec rake test`；超时 120s；输出截断 4000 字符 |
 
-`edit_source` 不提供整文件覆盖，避免误删用户改动。需要新增文件时用 `old_string: ""` 且在 `reason` 中说明（v1 仅允许 `test/` 下新增文件）。
+`edit_source` 不提供整文件覆盖，避免误删用户改动。新建文件时 `old_string: ""`，仅允许 `test/` 与 `docs/`。
 
 ### 6.2 路径白名单
 
@@ -187,7 +189,7 @@ def resolve(path)
 end
 ```
 
-`Rubycog.root` 通过 `File.expand_path('../..', __dir__)` 计算，并在启动时校验存在 `rubycog.gemspec`。gem 安装模式下目录通常不可写：`edit_source` 直接返回"只读安装，请改为输出补丁"并附带 `diff` 格式文本，不写盘。
+`Rubycog.root` 通过 `File.expand_path('..', __dir__)` 计算，并在启动时校验存在 `rubycog.gemspec`。gem 安装目录通常不可写：当前写入失败会把错误返回给模型；尚未实现“只读安装时输出补丁”的降级。
 
 ### 6.3 写入安全
 
@@ -201,7 +203,7 @@ end
 
 | 版本 | 策略 |
 | --- | --- |
-| v1 | 修改后提示"重启生效"。`/restart` 保存 transcript（`chat.messages.map(&:to_h)` 落 `.rubycog/session.json`），`exec` 重启进程后恢复消息 |
+| v1 | 已实现：`/restart` 保存会话（`Session` 文件）并 `exec` 重启，启动时恢复；TUI 检测 `lib/**/*.rb` 变化并在 footer 提示 `code changed — /restart to apply` |
 | v2 | `/reload` 用 `load` 重载改动文件；仅对无实例状态的模块（`error_report`、`text`）安全；`Agent`/`TUI` 仍建议重启 |
 
 设计取舍：不假装热修复成功。当前进程里的 `EvalTool` 实例、`Agent` 的 `chat` 工具注册表、`TUI` 的渲染逻辑都持有旧对象；`load` 只换方法，不换对象，容易出现"改完还是旧行为"的假象。v1 用重启换确定性。
@@ -242,7 +244,7 @@ end
 1. 改源码需审批；`--yolo` 免审批但仍备份、仍跑检查、仍写审计。
 2. 路径白名单 + 根目录逃逸检查；禁 `.git`、密钥、`.env`、`Gemfile.lock`。
 3. 不执行 git 写操作（`add`/`commit`/`reset`/`checkout`），只允许只读 `git status`。
-4. 不改自修工具自身（`self_repair.rb`、`tools/edit_source.rb`），避免失控；确需修改时提示用户手动处理。
+4. 不改自修工具自身（`source_path.rb`、`source_edit.rb`、`self_iteration.rb`、`tools/edit_source.rb`）——已由 `SourcePath` 的写保护实现；确需修改时提示用户手动处理。
 5. 测试失败、语法失败一律回滚，保留备份路径供排查。
 6. 报告与审计不记录凭据；错误消息中若疑似含密钥（如 URL 带 token），以 `[REDACTED]` 替换。
 7. 会话结束或 `Ctrl-C` 时不再发起新补丁；已批准的操作允许完成当前原子写。
@@ -281,18 +283,20 @@ When a tool result starts with [EVAL ERROR]:
 
 | 文件 | 动作 |
 | --- | --- |
-| `lib/rubycog/error_report.rb` | 新增：异常分类证据、栈裁剪、源码片段、脱敏、文本渲染 |
-| `lib/rubycog/self_repair.rb` | 新增：预算、指纹、审计、路径白名单、备份/回滚 |
-| `lib/rubycog/tools/read_source.rb` | 新增：只读源码 |
-| `lib/rubycog/tools/edit_source.rb` | 新增：原子编辑 + diff |
-| `lib/rubycog/tools/run_tests.rb` | 新增：受限测试执行 |
-| `lib/rubycog/eval_tool.rb` | 改 `execute` 的 rescue 与返回值；`eval` 传文件名与起始行 |
-| `lib/rubycog/agent.rb` | 已完成 `result.content` 兼容修复；余下扩 rescue、注册新工具、指令增补、注入系统上下文 |
-| `lib/rubycog/tui.rb` | 错误结果折叠与分类标识；`/restart`；footer 显示修复预算 |
-| `lib/rubycog.rb` | require 新文件 |
-| `test/error_report_test.rb` 等 | 新增测试 |
-| `README.md` | 补自修说明与权限边界 |
-| `.gitignore` | 加 `.rubycog/` |
+| `lib/rubycog/error_report.rb` | 未实现：异常分类证据、栈裁剪、源码片段、脱敏、文本渲染 |
+| `lib/rubycog/self_iteration.rb` | 已实现：审计、摘要、条数上限、0600 权限 |
+| `lib/rubycog/source_path.rb` | 已实现：白名单、目录逃逸、符号链接、写保护 |
+| `lib/rubycog/source_edit.rb` | 已实现：读取、diff、备份、原子写、`ruby -c`、回滚 |
+| `lib/rubycog/tools/read_source.rb` | 已实现：只读源码 |
+| `lib/rubycog/tools/edit_source.rb` | 已实现：原子编辑 + diff + 审计 |
+| `lib/rubycog/tools/run_tests.rb` | 已实现：受限测试执行 + 审计 |
+| `lib/rubycog/eval_tool.rb` | 已完成扩 rescue、eval 文件名与起始行；余下 ErrorReport 的分类证据与源码片段 |
+| `lib/rubycog/agent.rb` | 已完成 `result.content` 兼容、扩 rescue、注册四工具、指令增补 |
+| `lib/rubycog/tui.rb` | 已完成 `/restart`、`/self`、源码变更提示；错误分类标识未做 |
+| `lib/rubycog.rb` | 已 require 新文件 |
+| `test/source_edit_test.rb` 等 | 已新增路径/编辑/工具/审计测试 |
+| `README.md` | 已补自修说明与权限边界 |
+| `.gitignore` | 已加 `.rubycog/` |
 
 ## 12. 测试计划
 
@@ -338,4 +342,4 @@ When a tool result starts with [EVAL ERROR]:
 
 1. **"系统本身"的边界**：是否包含 `ruby_llm`/`curses` 等依赖？本文按"改 RubyCog 层 workaround，不改 gem"处理。
 2. **自修授权**：改源码默认逐次审批，还是需要额外 `--allow-self-edit` 显式开启？本文按"默认开启分诊、改源码需审批"处理。
-3. **生效方式**：v1 是否接受"重启才生效"？若要求热生效，需要先实现会话持久化（RubyLLM `Message#to_h` 可用，`chat.messages=` 可恢复）。
+3. **生效方式**：已按"重启生效"实现（`/restart` 保存会话 + 进程重启 + 启动恢复）；未实现热重载。
