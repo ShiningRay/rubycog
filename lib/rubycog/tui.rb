@@ -14,7 +14,7 @@ module Rubycog
   # Curses UI: transcript, input, approvals, session footer and restart.
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
-    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/reset-eval  drop eval local variables\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
+    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/reset-eval  drop eval local variables\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/experiences  list learned external patterns\n/proposals  list evolution proposals\n/evolve  drive one self-evolution loop\n/introspect  scan for code smells and propose cleanups\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
     STATS_INTERVAL = 2.0
     TICK_INTERVAL = 0.25 # footer clock repaint while a turn runs
     CODE_COLOR = 5
@@ -332,6 +332,62 @@ module Rubycog
       when '/self'
         text = @self_iteration ? @self_iteration.to_text : 'self-iteration: not configured'
         @entries << { role: :info, text: text }
+      when '/experiences'
+        store = Experience.new
+        hits = store.all
+        text = if hits.empty?
+                 'no experiences recorded yet (use learn_from_url + save_experience)'
+               else
+                 hits.first(20).map { |e| Experience.to_line(e) }.join("\n") +
+                   "\n(#{hits.size} total, showing first 20)"
+               end
+        @entries << { role: :info, text: text }
+      when '/proposals'
+        store = Proposal.new
+        hits = store.all
+        text = if hits.empty?
+                 'no proposals recorded yet (use propose_evolution)'
+               else
+                 hits.first(20).map { |e| Proposal.to_line(e) }.join("\n") +
+                   "\n(#{hits.size} total, showing first 20)"
+               end
+        @entries << { role: :info, text: text }
+      when '/evolve'
+        message = <<~PROMPT.strip
+          Drive one self-evolution loop on RubyCog:
+            1. Call suggest_proposals to find experiences no proposal has referenced yet.
+            2. Pick the single most valuable one and call propose_evolution with title,
+               motivation, touches, test_plan, and a tight budget.
+            3. Ask me to approve via approve_proposal, then run_evolution.
+            4. Inside the worktree, make the change with evolution_edit (budget enforced),
+               verify with evolution_run_tests.
+            5. If a benchmarks/ directory exists, call evolution_benchmark to compare
+               main vs worktree. If it regresses, finish with success: false.
+            6. finish_evolution with notes summarizing the change.
+          Stop after one loop and wait for my review before merging.
+        PROMPT
+        @entries << { role: :user, text: message, at: Time.now }
+        start_turn
+        @busy = true
+        @status = 'thinking'
+        @top = nil
+        @worker = Thread.new { converse(message) }
+      when '/introspect'
+        message = <<~PROMPT.strip
+          Run one self-introspection pass on RubyCog:
+            1. Call introspect_code to scan lib/ with rubocop, reek, and the heuristic scanner.
+            2. Read the top offenders with read_source to understand each smell.
+            3. Write up to two proposals: pick the worst smell and the best performance
+               opportunity. Use category=refactor for smell removal, category=performance
+               for speed/memory work.
+            4. Do NOT approve or run them yet — wait for my review.
+        PROMPT
+        @entries << { role: :user, text: message, at: Time.now }
+        start_turn
+        @busy = true
+        @status = 'thinking'
+        @top = nil
+        @worker = Thread.new { converse(message) }
       when '/gc' then collect_garbage
       when '/reset-eval'
         @agent.reset_eval

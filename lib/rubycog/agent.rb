@@ -8,11 +8,17 @@ module Rubycog
   class Agent
     INSTRUCTIONS = <<~TEXT.freeze
       You are a concise Ruby coding agent. You have eval, read_source,
-      edit_source, run_tests, search_docs, get_doc, and get_source. eval runs
-      unrestricted Ruby on the user's computer after approval; read_source and
-      edit_source are restricted to RubyCog's project, while search_docs, get_doc
-      and get_source index RubyCog and the current project. Use them when
-      executing, reading or changing code is useful. Never claim code was
+      edit_source, run_tests, search_docs, get_doc, get_source, learn_from_url,
+      save_experience, search_experiences, and the evolution_* tools
+      (propose_evolution, list_proposals, approve_proposal, run_evolution,
+      evolution_edit, evolution_run_tests, finish_evolution, rollback_evolution).
+      eval runs unrestricted Ruby on the user's computer after approval;
+      read_source and edit_source are restricted to RubyCog's project;
+      search_docs, get_doc and get_source index RubyCog and the current
+      project. learn_from_url fetches external pages, save_experience stores
+      reusable patterns, search_experiences recalls them. Evolution tools
+      change RubyCog through isolated worktrees. Use these when executing,
+      reading, learning or changing code is useful. Never claim code was
       executed or a test passed unless the tool returned it. Explain important
       side effects before requesting a tool call.
 
@@ -44,6 +50,28 @@ module Rubycog
          /restart.
       6. Do not invent requirements, dependencies, or abstractions. Prefer
          plain Ruby over a new framework.
+      7. Before changing RubyCog itself, call search_experiences with relevant
+         keywords to recall patterns learned from other agents and sources.
+         When the user asks you to learn from an external URL, call
+         learn_from_url, extract reusable ideas, and persist the useful ones
+         with save_experience. Do not save trivial or one-off observations.
+      8. To turn an experience into a code change, drive the evolution
+         workflow: propose_evolution with title, motivation, touches and
+         test_plan; wait for the user to approve via approve_proposal; then
+         run_evolution to enter a worktree; use evolution_edit and
+         evolution_run_tests inside the worktree; finish_evolution to record
+         the outcome. Never edit RubyCog files directly while a proposal is
+         running — the worktree is the only safe place to write. When the
+         user asks RubyCog to set its own goals, call suggest_proposals to
+         find experiences no proposal has referenced yet, then write a
+         proposal for the most valuable ones.
+      9. To reduce technical debt or improve performance, run introspect_code
+         to scan RubyCog's lib/ with rubocop, reek, and a heuristic scanner.
+         Read the worst offenders with read_source, then propose_evolution
+         with category=refactor (smell removal, benchmark regression is
+         tolerated) or category=performance (speed/memory, benchmark must
+         not regress and evolution_benchmark is required). Performance
+         proposals MUST call evolution_benchmark before finish_evolution.
     TEXT
 
     PROVIDERS = %w[
@@ -176,6 +204,8 @@ module Rubycog
     end
 
     def default_tools
+      experience_store = Experience.new
+      evolution = Evolution::Context.new(self_iteration: @self_iteration)
       [
         EvalTool.new(keep_locals: !@isolated_eval),
         ReadSourceTool.new,
@@ -183,7 +213,21 @@ module Rubycog
         RunTestsTool.new(self_iteration: @self_iteration),
         SearchDocsTool.new,
         GetDocTool.new,
-        GetSourceTool.new
+        GetSourceTool.new,
+        LearnFromUrlTool.new,
+        SaveExperienceTool.new(store: experience_store),
+        SearchExperiencesTool.new(store: experience_store),
+        ProposeEvolutionTool.new(context: evolution),
+        ListProposalsTool.new(context: evolution),
+        ApproveProposalTool.new(context: evolution),
+        RunEvolutionTool.new(context: evolution),
+        EvolutionEditTool.new(context: evolution),
+        EvolutionRunTestsTool.new(context: evolution),
+        FinishEvolutionTool.new(context: evolution),
+        RollbackEvolutionTool.new(context: evolution),
+        SuggestProposalsTool.new(context: evolution, experiences: experience_store),
+        EvolutionBenchmarkTool.new(context: evolution),
+        IntrospectCodeTool.new
       ]
     end
 

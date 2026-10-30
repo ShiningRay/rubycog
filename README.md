@@ -5,7 +5,7 @@
 ## 特性
 
 - RubyLLM 2.1：同一套代码使用 OpenAI、Anthropic、Gemini、DeepSeek、OpenRouter、Ollama 等提供商。
-- 工具：`eval` 执行 Ruby；`read_source`、`edit_source`、`run_tests` 用于受控的自我迭代；`search_docs`、`get_doc`、`get_source` 检索源码文档。
+- 工具：`eval` 执行 Ruby；`read_source`、`edit_source`、`run_tests` 用于受控的自我迭代；`search_docs`、`get_doc`、`get_source` 检索源码文档；`learn_from_url`、`save_experience`、`search_experiences` 从外部来源学习可复用经验；`propose_evolution`、`approve_proposal`、`run_evolution`、`evolution_edit`、`evolution_run_tests`、`evolution_benchmark`、`finish_evolution`、`rollback_evolution`、`suggest_proposals` 在隔离 worktree 中把经验转为代码改动；`introspect_code` 用 rubocop + reek + 启发式扫描发现坏味道、技术债、性能问题，并按 `category=refactor | performance` 分流提案。
 - 编码工作流：先说明目标与约束，再写最小实现；跑通后审查可复用部分，满足条件才抽成方法、类或模块。
 - 默认在写操作与测试执行前显示调用摘要，按 `y` 批准，按 `n` 拒绝；可用 `--yolo` 或 `/yolo` 切换为免审批。
 - Curses TUI：流式回答、工具输出、历史滚动、UTF-8 输入，顶栏显示当前工作目录，底部显示对象数与进程内存。
@@ -107,6 +107,12 @@ bin/rubycog --model qwen3
 修改 RubyCog 自身源码后，当前进程仍运行旧类。模型应先跑相关测试，再明确提示重启；TUI 检测到 `lib/**/*.rb` 变化时 footer 会显示 `code changed — /restart to apply`。按 `/restart` 保存会话并重启，新的进程才会加载改动。
 
 自我迭代与源码检索使用这些工具：`eval` 执行 Ruby；`read_source` 读取白名单源码；`search_docs` 按关键词搜索类/方法上方的文档注释；`get_doc` 读取注释；`get_source` 读取方法源码；`edit_source` 做唯一匹配替换（审批、备份、Ruby 文件跑 `ruby -c`、失败回滚）；`run_tests` 跑指定或全量测试（审批、超时、输出截断）。写入只允许 `lib/`、`test/`、`docs/`、`bin/rubycog`、`README.md`、`Gemfile`、`rubycog.gemspec`；`.git`、`.env`、密钥、`.rubycog/`、`Gemfile.lock` 禁止；编辑器与路径守卫本身不可自我写入。每次编辑与测试记录在 `.rubycog/self_iteration.json`，用 `/self` 查看。机制细节见 [docs/self-iteration.md](docs/self-iteration.md)，源码文档检索见 [docs/source-docs.md](docs/source-docs.md)。
+
+外部学习使用三个工具：`learn_from_url` 抓取外部 URL 并返回可读文本；`save_experience` 把提炼后的可复用经验存为 YAML（`.rubycog/experiences/`）；`search_experiences` 在改自己之前按关键词召回相关经验。TUI 用 `/experiences` 查看已存条目。机制细节见 [docs/experience.md](docs/experience.md)。
+
+自我进化把经验落地为代码改动：`propose_evolution` 写提案；`approve_proposal` 批准；`run_evolution` 在 `.rubycog/worktrees/<id>` 上开 `evo/<id>` 分支并进入 running 状态；`evolution_edit` 在 worktree 内做唯一匹配替换（备份、`ruby -c`、原子写、budget 强制 `max_files/max_lines`）；`evolution_run_tests` 在 worktree 内跑测试；`evolution_benchmark` 对比 main 与 worktree 下 `benchmarks/*.rb` 的数值分数，回归超 5% 自动阻止 `finish_evolution(success: true)`（可 `force: true` 覆盖）；`suggest_proposals` 扫描未被任何提案引用的经验，让模型自主设定下一步目标；用户手动 `git merge evo/<id>` 或 `rollback_evolution` 丢弃。所有写操作均限制在 worktree 内，主 checkout 不被修改。TUI 用 `/proposals` 查看提案，用 `/evolve` 一键驱动一轮自我进化闭环（每步仍需审批）。机制细节见 [docs/evolution.md](docs/evolution.md)。
+
+自省环节用 `introspect_code` 扫描 RubyCog 自身：跑 `bundle exec rubocop` + `bundle exec reek`，再做纯 Ruby 启发式扫描（.bak 文件、超长方法/文件、多参数、重复块、注释掉的代码），把报告写到 `.rubycog/introspection/<stamp>.md` 并返回紧凑摘要。模型据此 `read_source` 读关键文件，写 `category=refactor`（允许基准回归）或 `category=performance`（必须基准改善且 `evolution_benchmark` 为必需）的提案。`benchmarks/` 自带 alloc/memsize/boot_time 三个数值基准（direction=lower）。TUI 用 `/introspect` 一键驱动自省 + 提案生成。机制细节见 [docs/introspection.md](docs/introspection.md)。
 
 ## eval 内存与会话隔离
 
