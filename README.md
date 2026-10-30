@@ -105,6 +105,8 @@ bin/rubycog --model qwen3
 
 助手消息里标注了语言的围栏代码块也走同一套高亮：```` ```ruby ````（或 ```` ```rb ````）按 Ruby 上色，其它语言和未标注的围栏保持纯代码色——把 `json`、`sh` 当 Ruby 猜会让 `if`/`then`/`end` 亮错地方。围栏标记支持尾随参数（如 ```` ```ruby title=demo ````），大小写不敏感。
 
+`read_source` 的结果按文件类型高亮：首行 `# path (lines a-b)` 作标题，行号栏保持统一的代码色（不会被当成数字字面量），其后的源码按文件类型选分词器——`.rb`/`.gemspec`/`Gemfile`/`bin/rubycog` 用上面那套 Ruby 规则；`.json`、`.yml`/`.yaml`/`.toml`/`Gemfile.lock`、`.sh`、`.py`、`.js`/`.ts`、C 系（`.go`/`.rs`/`.c`/`.java` 等）、`.md` 各有自己的规则（字符串、注释、数字、关键字，YAML 的键用青色）。未知扩展名（如 `.txt`）统一用代码色而不猜语言。这类结果不再经过 Markdown 行内规则，所以源码里的 `*args`、`**opts`、反引号会原样显示。
+
 修改 RubyCog 自身源码后，当前进程仍运行旧类。模型应先跑相关测试，再明确提示重启；TUI 检测到 `lib/**/*.rb` 变化时 footer 会显示 `code changed — /restart to apply`。按 `/restart` 保存会话并重启，新的进程才会加载改动。
 
 自我迭代与源码检索使用这些工具：`eval` 执行 Ruby；`read_source` 读取白名单源码；`search_docs` 按关键词搜索类/方法上方的文档注释；`get_doc` 读取注释；`get_source` 读取方法源码；`edit_source` 做唯一匹配替换（审批、备份、Ruby 文件跑 `ruby -c`、失败回滚）；`run_tests` 跑指定或全量测试（审批、超时、输出截断）。写入只允许 `lib/`、`test/`、`docs/`、`bin/rubycog`、`README.md`、`Gemfile`、`rubycog.gemspec`；`.git`、`.env`、密钥、`.rubycog/`、`Gemfile.lock` 禁止；编辑器与路径守卫本身不可自我写入。每次编辑与测试记录在 `.rubycog/self_iteration.json`，用 `/self` 查看。机制细节见 [docs/self-iteration.md](docs/self-iteration.md)，源码文档检索见 [docs/source-docs.md](docs/source-docs.md)。
@@ -131,6 +133,24 @@ bin/rubycog --model qwen3
 ## 安全说明
 
 **`eval` 不是沙箱。** 模型生成的 Ruby 代码拥有当前用户的完整权限，可以读写文件、访问网络、读取环境变量及执行系统命令。`edit_source` 虽受路径白名单与备份保护，但仍会改项目源码，审批前应看清算要改的文件与原因。生产环境或多租户环境应在额外隔离中运行。`--yolo` 启动参数或 `/yolo` 指令会跳过逐次审批，所有工具调用（含写文件）将直接执行；只应在完全可信的项目中使用，TUI 会持续显示 `YOLO` 标记。
+
+## 依赖变更
+
+新增或升级 gem 时，`Gemfile`、`rubycog.gemspec` 与 `Gemfile.lock` 要一起更新，然后执行 `bundle install`：
+
+```sh
+bundle install
+```
+
+忘记安装时不必担心会话丢失，两层保护会给出可读的提示：
+
+- `/restart` 先用子进程按新进程的方式加载一次 bundle，失败就拒绝重启，在转录区显示一行原因（如 `restart refused: Could not find gem 'dotenv' in locally installed gems.`），当前会话照常可用。装好后再次 `/restart` 即可。
+- 直接启动 `bin/rubycog` 时，入口脚本会在 `bundle install` 前捕获失败，提示 `the bundle is not installed` 并退出，而不是抛出一屏 backtrace。
+- 运行中改动了 `Gemfile`、`Gemfile.lock` 或 `rubycog.gemspec`，页脚会提示 `dependencies changed — bundle install, then /restart`，而不是笼统的 `code changed`。
+
+重启时会清掉 bundler 留给子进程的 `BUNDLER_SETUP` 与 `RUBYOPT` 预加载。否则 RubyGems 会在 `bin/rubycog` 执行之前就加载 bundle，缺 gem 时连提示都来不及打印。
+
+`test/dependencies_test.rb` 会检查 gemspec 的运行时依赖都出现在 `Gemfile` 与 `Gemfile.lock` 中，并确认入口脚本语法正确、缺依赖时报错可读。
 
 ## 开发
 

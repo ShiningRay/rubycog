@@ -2,6 +2,7 @@
 
 require 'curses'
 require 'io/console'
+require 'open3'
 require 'rbconfig'
 require 'time'
 require_relative 'text'
@@ -27,6 +28,9 @@ module Rubycog
     PULSE_RAMP_8 = [Curses::COLOR_BLUE, Curses::COLOR_CYAN,
                     Curses::COLOR_WHITE, Curses::COLOR_CYAN].freeze
     SEARCH_KEY = 6 # Ctrl-F
+    # Loads the bundle the way the restarted process will, printing only the
+    # failure message so the footer can show a one-line reason.
+    RELOAD_PROBE = 'begin; require "bundler/setup"; rescue StandardError, LoadError => e; abort e.message; end'
     WHEEL_STEP = 3 # rows per wheel notch
     # ncurses stores button n's state in 6-bit slots, press being bit 1. Wheel
     # down is BUTTON5, which ncurses only learnt in 6.1: on 6.0 the binding has
@@ -58,6 +62,7 @@ module Rubycog
       @session = session
       @self_iteration = self_iteration
       @argv = argv.dup
+      @program = File.expand_path($PROGRAM_NAME)
       @events = Queue.new
       @approvals = Queue.new
       turns = history_entries(history)
@@ -103,6 +108,7 @@ module Rubycog
       @shown_code = nil
       @source_digest = source_snapshot
       @source_stale = false
+      @deps_stale = false
       @idle_watcher = nil
       @idle_enabled = false
     end
@@ -142,7 +148,7 @@ module Rubycog
         @worker&.join(1)
       end
       Curses.close_screen
-      exec(RbConfig.ruby, $PROGRAM_NAME, *@argv) if action == :restart
+      exec(restart_env, RbConfig.ruby, @program, *@argv) if action == :restart
     end
 
     private
@@ -191,7 +197,7 @@ module Rubycog
     # classes. Track the snapshot so the footer can ask for a restart.
     def source_snapshot
       paths = Dir[File.join(Rubycog.root, 'lib', '**', '*.rb')]
-      paths += [File.join(Rubycog.root, 'Gemfile'), File.join(Rubycog.root, 'bin', 'rubycog')]
+      paths += [File.join(Rubycog.root, 'bin', 'rubycog')] + dependency_paths
       paths.sort.each_with_object({}) do |path, snapshot|
         next unless File.file?(path)
 
@@ -202,10 +208,19 @@ module Rubycog
       {}
     end
 
+    # Files whose change means the bundle must be installed again before a
+    # restart can succeed.
+    def dependency_paths
+      %w[Gemfile Gemfile.lock rubycog.gemspec].map { |name| File.join(Rubycog.root, name) }
+    end
+
     def refresh_source_state
-      @source_stale = source_snapshot != @source_digest
+      current = source_snapshot
+      @source_stale = current != @source_digest
+      @deps_stale = dependency_paths.any? { |path| current[path] != @source_digest[path] }
     rescue StandardError
       @source_stale = false
+      @deps_stale = false
     end
 
     def init_colors
@@ -312,7 +327,12 @@ module Rubycog
       case message
       when '/quit', '/exit' then return :quit
       when '/restart'
-        return :restart if save_session
+        if save_session
+          problem = restart_problem
+          return :restart unless problem
+
+          @entries << { role: :error, text: "restart refused: #{problem}" }
+        end
       when '/clear'
         if @agent.chat.complete?
           @agent.reset
@@ -908,8 +928,13 @@ module Rubycog
       cached = entry[:layout]
       return cached[:rows] if cached && cached[:width] == body && cached[:text] == entry[:text]
 
+      # Tool code is Ruby by nature; a read_source result names its file, so it
+      # is tokenised for that file's language. Both keep the plain code colour
+      # for anything the highlighter does not claim.
       styled = if entry[:role] == :tool
                  Markdown.ruby_lines(entry[:text], body)
+               elsif entry[:role] == :result && Markdown.source?(entry[:text])
+                 Markdown.source_lines(entry[:text], body)
                else
                  Markdown.lines(entry[:text], body)
                end
@@ -927,6 +952,8 @@ module Rubycog
                draw_plain_footer(y, width, search_text)
              elsif @top
                draw_plain_footer(y, width, scrolled_text)
+             elsif @deps_stale
+               draw_plain_footer(y, width, 'dependencies changed — bundle install, then /restart')
              elsif @source_stale
                draw_plain_footer(y, width, 'code changed — /restart to apply')
              elsif @busy
@@ -1040,6 +1067,42 @@ module Rubycog
       snapshot = stats_snapshot
       @objects = snapshot[:objects]
       @memory = snapshot[:memory]
+    end
+
+    # Environment for the dependency probe and for the restarted process.
+    #
+    # Bundler leaves BUNDLER_SETUP and a -rbundler/setup entry in RUBYOPT for
+    # child processes, and RubyGems requires either one before any script runs.
+    # A restart that inherited them died inside rubygems when the bundle was
+    # missing a gem, before bin/rubycog could rescue and explain. Clearing both
+    # lets the script load the bundle itself and report a readable error.
+    def restart_env
+      env = { 'BUNDLER_SETUP' => nil,
+              'BUNDLE_GEMFILE' => ENV['BUNDLE_GEMFILE'] || File.join(Rubycog.root, 'Gemfile') }
+      preload = ENV.fetch('RUBYOPT', '').split.reject { |opt| opt.include?('bundler/setup') }
+      env['RUBYOPT'] = preload.empty? ? nil : preload.join(' ')
+      env
+    end
+
+    # Confirms a fresh process can load the bundle before /restart replaces this
+    # one, returning a problem description or nil when the restart is safe.
+    #
+    # The check runs the exact require the new process starts with, in a child,
+    # because a gem added to the Gemfile but never installed used to kill the
+    # session with only a backtrace on stderr. Leaving the TUI alive means the
+    # user can run bundle install and retry without losing the conversation.
+    def restart_problem(gemfile: ENV['BUNDLE_GEMFILE'] || File.join(Rubycog.root, 'Gemfile'))
+      return nil unless File.file?(gemfile)
+
+      output, status = Open3.capture2e(restart_env.merge('BUNDLE_GEMFILE' => gemfile),
+                                       RbConfig.ruby, '-e', RELOAD_PROBE,
+                                       chdir: File.dirname(gemfile))
+      return nil if status.success?
+
+      detail = output.lines.map(&:strip).reject(&:empty?).first
+      detail || 'the bundle is not installed (run bundle install)'
+    rescue SystemCallError
+      nil # cannot probe the bundle; let the exec try as before
     end
 
     def save_session

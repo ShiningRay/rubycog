@@ -126,7 +126,101 @@ class MarkdownTest < Minitest::Test
     assert_empty Rubycog::Markdown.lines(nil, 20)
   end
 
+  def test_recognises_read_source_results_only
+    assert Rubycog::Markdown.source?("# lib/rubycog/x.rb (lines 1-2)\n   1 | def size = 42")
+    refute Rubycog::Markdown.source?('read_source error: file is too large')
+    refute Rubycog::Markdown.source?('# Just a heading')
+  end
+
+  def test_source_rows_show_the_file_as_a_heading_over_a_coded_gutter
+    text = "# lib/rubycog/x.rb (lines 1-1)\n   1 | def size = 42 # answer"
+    rows = Rubycog::Markdown.source_lines(text, 80)
+
+    assert_equal ['lib/rubycog/x.rb', '     1 | def size = 42 # answer'], rows.map(&:text)
+    assert_equal [['     1 | ', :code], ['def', :keyword], [' ', nil],
+                  ['size', :method], [' = ', nil], ['42', :number], [' ', nil],
+                  ['# answer', :comment]], runs_of(rows.last)
+  end
+
+  def test_source_rows_tokenise_each_file_type
+    assert_equal [['     1 | ', :code], ['name', :method], [': rubycog ', nil],
+                  ['# note', :comment]],
+                 source_runs("# config/a.yml (lines 1-1)\n   1 | name: rubycog # note")
+    assert_equal [['     1 | ', :code], ['{ ', nil], ['"a"', :string], [': ', nil],
+                  ['1', :number], [', ', nil], ['"b"', :string], [': ', nil],
+                  ['"x"', :string], [' }', nil]],
+                 source_runs("# data.json (lines 1-1)\n   1 | { \"a\": 1, \"b\": \"x\" }")
+    assert_equal [['     1 | ', :code], ['if', :keyword], [' [ -f x ]; ', nil],
+                  ['then', :keyword], [' ', nil], ['echo', :keyword], [' ', nil],
+                  ['"a#b"', :string]],
+                 source_runs("# run.sh (lines 1-1)\n   1 | if [ -f x ]; then echo \"a#b\"")
+  end
+
+  def test_source_rows_keep_markdown_markers_inside_code
+    line = 'def call(*args, **opts) # `backtick` and *star*'
+    rows = Rubycog::Markdown.source_lines("# lib/x.rb (lines 1-1)\n   1 | #{line}", 200)
+
+    assert_equal "     1 | #{line}", rows.last.text
+  end
+
+  def test_source_rows_never_change_the_file_lines
+    { 'README.md' => '# Heading with **bold** and `code`',
+      'a.yml' => 'name: value # note',
+      'a.json' => '{ "a": 1, "b": true }',
+      'a.sh' => 'if [ -f x ]; then echo "$y"; fi',
+      'a.rb' => 'def size = 42 # answer',
+      'a.txt' => '*kept as written*' }.each do |path, content|
+      line = "   1 | #{content}"
+      rows = Rubycog::Markdown.source_lines("# #{path} (lines 1-1)\n#{line}", 200)
+
+      assert_equal "  #{line}", rows.last.text, path
+    end
+  end
+
+  def test_markdown_files_keep_their_markers_and_show_headings
+    assert_equal [['     1 | ', :code], ['# Heading', :heading]],
+                 source_runs("# README.md (lines 1-1)\n   1 | # Heading")
+  end
+
+  def test_unknown_file_types_stay_plain_code
+    styles = source_runs("# notes.txt (lines 1-1)\n   1 | def size = 42").map(&:last).uniq
+
+    assert_equal [:code], styles
+  end
+
+  def test_source_rows_wrap_like_plain_code
+    line = "   1 | value = \"#{'a' * 30}\" # a comment long enough to wrap"
+    text = "# lib/x.rb (lines 1-1)\n#{line}"
+    plain = Rubycog::Markdown.code_lines(line, 20).map(&:text)
+    source = Rubycog::Markdown.source_lines(text, 20).map(&:text)
+
+    assert_equal plain, source.last(plain.length)
+  end
+
+  def test_names_the_language_from_the_file_name
+    { 'lib/rubycog/x.rb' => :ruby, 'bin/rubycog' => :ruby, 'Gemfile' => :ruby,
+      'Gemfile.lock' => :yaml, 'config/a.yml' => :yaml, 'data.json' => :json,
+      'README.md' => :markdown, 'a.py' => :python, 'a.ts' => :javascript,
+      'a.go' => :c_like, 'notes.txt' => nil, 'LICENSE' => nil }.each do |path, language|
+      if language
+        assert_equal language, Rubycog::Syntax.for_path(path), path
+      else
+        assert_nil Rubycog::Syntax.for_path(path), path
+      end
+    end
+  end
+
   private
+
+  # [text, style] runs of the row that holds the last line of a source result,
+  # so a test can state the expected highlighting as a short list.
+  def source_runs(text)
+    runs_of(Rubycog::Markdown.source_lines(text, 80).last)
+  end
+
+  def runs_of(row)
+    row.segments.chunk_while { |a, b| a[1] == b[1] }.map { |run| [run.map(&:first).join, run.first[1]] }
+  end
 
   # Runs of [text, style] for one line, with identical neighbours merged, so a
   # test can state the expected highlighting as a short list.

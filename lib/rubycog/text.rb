@@ -186,6 +186,68 @@ module Rubycog
       fill(line.each_char.map { |char| [char, :code] }, inner).map { |row| row.indented('  ', :code) }
     end
 
+    # A read_source result opens with "# path (lines a-b)" and then prints
+    # "%4d | code" rows. That text is source, not prose, so it must not go
+    # through the inline rules: markdown would read *args and `backticks` in the
+    # code as emphasis and delete the markers.
+    SOURCE_HEADER = /\A# (\S.*?) \(lines \d+-\d+\)\z/
+    GUTTER = /\A( *\d+ \| )(.*)\z/
+
+    # True when the text looks like a read_source result, whose first line names
+    # the file and the line range the rows came from.
+    def source?(text)
+      SOURCE_HEADER.match?(text.to_s.split("\n", 2).first.to_s)
+    end
+
+    # Rows for a read_source result. The header reads as a heading over the code,
+    # and each row keeps its gutter in the plain code colour so line numbers are
+    # never mistaken for numeric literals; the code after the gutter is tokenised
+    # for the language the file name names. Indent and wrap match code_rows, so
+    # search and scrolling see the usual rows.
+    def source_lines(text, width)
+      lines = text.to_s.split("\n", -1)
+      path = lines.first.to_s[SOURCE_HEADER, 1]
+      language = Syntax.for_path(path)
+      rows = []
+      lines.each_with_index do |line, index|
+        if index.zero? && path
+          chars = []
+          add_chars(chars, path, :heading)
+          rows.concat(fill(chars, width))
+        else
+          rows.concat(source_rows(line, width, language))
+        end
+      end
+      rows
+    end
+
+    # One gutter-numbered line: gutter in code colour, code in its token styles.
+    # A language without rules keeps a uniform code colour rather than guessing.
+    def source_rows(line, width, language)
+      gutter, code = split_gutter(line)
+      chars = []
+      add_chars(chars, gutter, :code)
+      tokens = Syntax.chars(code, language)
+      tokens ? chars.concat(tokens) : add_chars(chars, code, :code)
+      inner = [width - 2, 1].max
+      fill(chars, inner).map { |row| row.indented('  ', :code) }
+    end
+
+    # " 123 | code" split into its gutter and the untouched source line. A line
+    # shorter than the header promises (a truncated tail) keeps an empty gutter.
+    def split_gutter(line)
+      match = GUTTER.match(line.to_s)
+      match ? [match[1], match[2]] : ['', line.to_s]
+    end
+
+    # Markdown files shown as source keep every character, markers included: this
+    # is the file, not a rendering of it. Only headings are picked out, because
+    # they are the one piece of structure worth seeing at a glance.
+    def markdown_chars(line)
+      heading = line.to_s.match?(HEADING)
+      line.to_s.each_char.map { |char| [char, heading ? :heading : nil] }
+    end
+
     # Splits a line into [char, style] pairs with the inline markers removed.
     def inline_chars(line, base = nil)
       chars = []
@@ -267,12 +329,24 @@ module Rubycog
 
     # [char, style] pairs for one line, in order, with no character dropped.
     def chars(line)
+      Tokenizer.chars(line, TOKEN, STYLE_FOR)
+    end
+  end
+
+  # Drives the line tokenisers: walks a pattern whose alternatives are named
+  # after token classes and returns [char, style] pairs in order. Unmatched text
+  # keeps a nil style, and no character is dropped, so a mis-tokenised line still
+  # renders exactly as written.
+  module Tokenizer
+    module_function
+
+    def chars(line, pattern, styles)
       out = []
       source = line.to_s
       pos = 0
-      while (match = TOKEN.match(source, pos))
+      while (match = pattern.match(source, pos))
         push(out, source[pos...match.begin(0)], nil)
-        push(out, match[0], STYLE_FOR[token_name(match)])
+        push(out, match[0], styles[token_name(match)])
         pos = match.end(0)
       end
       push(out, source[pos..], nil)
@@ -287,6 +361,128 @@ module Rubycog
 
     def push(out, text, style)
       text.to_s.each_char { |char| out << [char, style] }
+    end
+  end
+
+  # Generic tokeniser for the languages that have no rules of their own: read
+  # files of any type still get strings, numbers, comments and keywords. A
+  # language is a SPECS entry (comment marker, keyword list, optional keys), so
+  # adding one is a table entry rather than new code.
+  #
+  # Alternatives are ordered so a string starting before a comment marker wins
+  # over it, and keywords only match whole words. Like RubyHighlight this is a
+  # display aid: lines are tokenised one at a time, so half a construct costs
+  # colour, never text.
+  module CodeHighlight
+    module_function
+
+    # A backslash is spelled \x5c here so the pattern needs no doubled escape.
+    # Unterminated quotes are allowed: a line of a multi-line literal costs
+    # colour, never text.
+    STRING = /"(?:[^"\x5c]|\x5c.)*"?|'(?:[^'\x5c]|\x5c.)*'?/
+    NUMBER = /\b\d[\d_]*(?:\.\d[\d_]*)?\b/
+    COMMENT = { hash: /\#[^\n]*/, slash: /\/\/[^\n]*/ }.freeze
+
+    # Keyword lists are deliberately short: a missing word costs no colour,
+    # while a wrong one would light up in the wrong language. c_like pools the
+    # C family (C, Go, Rust, Java, Swift) because their overlap is all a display
+    # aid needs.
+    SPECS = {
+      json: { keywords: %w[true false null] },
+      yaml: { comment: :hash, keywords: %w[true false null yes no on off], keys: true },
+      shell: { comment: :hash,
+               keywords: %w[if then else elif fi for while until do done case esac in function
+                            return local export readonly echo exit set source break continue] },
+      python: { comment: :hash,
+                keywords: %w[def class return if elif else for while import from as with try
+                             except finally raise lambda yield assert pass break continue None
+                             True False and or not in is del global nonlocal self] },
+      javascript: { comment: :slash,
+                    keywords: %w[const let var function return if else for while do break
+                                 continue class extends new this import export from default async
+                                 await try catch finally throw typeof instanceof null true false
+                                 undefined of in delete void] },
+      c_like: { comment: :slash,
+                keywords: %w[if else for while do return switch case break continue struct enum
+                             class interface public private protected static const final void int
+                             char bool fn let mut pub use impl trait match loop type nil null true
+                             false func package import var] }
+    }.freeze
+
+    # YAML keys carry the method colour: a name at the start of a line is the
+    # closest thing YAML has to an identifier.
+    STYLE_FOR = { 'comment' => :comment, 'key' => :method, 'string' => :string,
+                  'number' => :number, 'keyword' => :keyword }.freeze
+
+    # One compiled pattern per language, built on first use: the keyword
+    # alternations are long and most sessions never read these files.
+    def patterns
+      @patterns ||= SPECS.to_h { |language, spec| [language, build(spec)] }
+    end
+
+    # [char, style] pairs for one line, or nil when the language has no spec.
+    def chars(line, language)
+      pattern = patterns[language]
+      pattern ? Tokenizer.chars(line, pattern, STYLE_FOR) : nil
+    end
+
+    def build(spec)
+      parts = []
+      parts << "(?<comment>#{COMMENT.fetch(spec[:comment]).source})" if spec[:comment]
+      parts << '(?<key>^[ \t-]*[\w.\/-]+(?=[ \t]*:))' if spec[:keys]
+      parts << "(?<string>#{STRING.source})"
+      parts << "(?<number>#{NUMBER.source})"
+      # Word-boundaries are written as lookarounds: a "\b" inside this
+      # double-quoted string would be a backspace character, not a boundary.
+      parts << "(?<keyword>(?<!\w)(?:#{keyword_source(spec[:keywords])})(?!\w))"
+      Regexp.new(parts.join('|'))
+    end
+
+    def keyword_source(words)
+      words.map { |word| Regexp.escape(word) }.join('|')
+    end
+  end
+
+  # Chooses the highlighter for a file the transcript is showing, by file name
+  # and extension. Only languages with rules are mapped: an unknown type stays
+  # plain code, because guessing would colour words in the wrong language, which
+  # reads worse than no colour at all.
+  module Syntax
+    module_function
+
+    # Names win over extensions: Gemfile and Rakefile have none, and the bin
+    # script is the only clue that bin/rubycog is Ruby.
+    BY_NAME = { 'Gemfile' => :ruby, 'Gemfile.lock' => :yaml, 'Rakefile' => :ruby,
+                'Guardfile' => :ruby, 'rubycog' => :ruby, '.rubocop.yml' => :yaml }.freeze
+
+    BY_EXTENSION = {
+      '.rb' => :ruby, '.rake' => :ruby, '.gemspec' => :ruby, '.ru' => :ruby,
+      '.json' => :json, '.yml' => :yaml, '.yaml' => :yaml, '.toml' => :yaml,
+      '.sh' => :shell, '.bash' => :shell, '.zsh' => :shell,
+      '.py' => :python, '.js' => :javascript, '.mjs' => :javascript,
+      '.ts' => :javascript, '.jsx' => :javascript, '.tsx' => :javascript,
+      '.c' => :c_like, '.h' => :c_like, '.cc' => :c_like, '.cpp' => :c_like,
+      '.go' => :c_like, '.rs' => :c_like, '.java' => :c_like, '.swift' => :c_like,
+      '.kt' => :c_like, '.cs' => :c_like, '.md' => :markdown, '.markdown' => :markdown
+    }.freeze
+
+    # Language id for a path, or nil when no rules fit it.
+    def for_path(path)
+      return nil if path.nil? || path.to_s.empty?
+
+      name = File.basename(path.to_s)
+      BY_NAME[name] || BY_EXTENSION[File.extname(name).downcase]
+    end
+
+    # [char, style] pairs for one line of `language`, or nil when the language
+    # has no rules and the caller should keep its plain code colour.
+    def chars(line, language)
+      case language
+      when nil then nil
+      when :ruby then RubyHighlight.chars(line)
+      when :markdown then Markdown.markdown_chars(line)
+      else CodeHighlight.chars(line, language)
+      end
     end
   end
 end

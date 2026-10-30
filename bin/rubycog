@@ -1,7 +1,23 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require 'bundler/setup'
+# Load the bundle of this checkout instead of whatever directory the user
+# happens to be in: bundler/setup searches upward from Dir.pwd, so starting the
+# agent from another project activated that project's gems or raised
+# GemfileNotFound. An installed gem has no Gemfile next to bin/, so it relies on
+# the gemspec dependencies and skips bundler entirely.
+gemfile = File.expand_path('../Gemfile', __dir__)
+if File.file?(gemfile)
+  ENV['BUNDLE_GEMFILE'] ||= gemfile
+  begin
+    require 'bundler/setup'
+  rescue LoadError, StandardError => e
+    warn "rubycog: the bundle is not installed (#{e.message})"
+    warn "rubycog: run `bundle install` in #{File.dirname(gemfile)} and start again"
+    exit 1
+  end
+end
+
 require_relative '../lib/rubycog'
 
 Rubycog::CLI.start(ARGV)

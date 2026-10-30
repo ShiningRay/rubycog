@@ -435,10 +435,26 @@ end
     chat = FakeChat.new
     agent = Struct.new(:chat).new(chat)
     tui = Rubycog::TUI.new(agent, session: session)
+    tui.define_singleton_method(:restart_problem) { |**| nil }
     tui.instance_variable_set(:@input, +'/restart')
 
     assert_equal :restart, tui.send(:submit)
     assert_equal [chat.messages, []], saved.first
+  end
+
+  def test_restart_is_refused_when_the_bundle_is_not_installed
+    saved = []
+    session = Object.new
+    session.define_singleton_method(:path) { '/tmp/session.json' }
+    session.define_singleton_method(:save) { |messages, stamps: nil| saved << [messages, stamps] }
+    tui = Rubycog::TUI.new(Struct.new(:chat).new(FakeChat.new), session: session)
+    tui.define_singleton_method(:restart_problem) { |**| "Could not find gem 'dotenv' in locally installed gems." }
+    tui.instance_variable_set(:@input, +'/restart')
+
+    assert_nil tui.send(:submit)
+    assert_equal 1, saved.size, 'the session is still saved before the probe runs'
+    assert_includes tui.instance_variable_get(:@entries).last[:text],
+      "restart refused: Could not find gem 'dotenv'"
   end
 
   def test_footer_marks_code_changes_as_needing_restart
@@ -460,6 +476,23 @@ end
     tui.send(:refresh_source_state)
 
     assert tui.instance_variable_get(:@source_stale)
+    refute tui.instance_variable_get(:@deps_stale)
+  end
+
+  def test_gemfile_change_asks_for_bundle_install_instead_of_a_plain_restart
+    tui = Rubycog::TUI.new(FakeChat.new)
+    gemfile = File.join(Rubycog.root, 'Gemfile')
+    tui.instance_variable_set(:@source_digest, { gemfile => [1, 1] })
+    tui.define_singleton_method(:source_snapshot) { { gemfile => [2, 1] } }
+    tui.send(:refresh_source_state)
+
+    assert tui.instance_variable_get(:@deps_stale)
+    window = FakeWindow.new(10, 120)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_footer, 10, 120)
+
+    assert_includes window.rows[7], 'bundle install'
+    assert_includes window.rows[7], '/restart'
   end
 
   def test_refresh_stats_collects_runtime_values
@@ -1008,6 +1041,31 @@ end
 
     assert_equal :restart, tui.send(:submit)
     assert_equal [{ role: :user, text: 'hi', at: at }], saved.first
+  end
+
+  def test_read_source_results_use_their_file_type_colours
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entry = { role: :result, text: "# data.json (lines 1-1)\n   1 | { \"ok\": true }" }
+
+    styles = tui.send(:body_rows, entry, 60).flat_map { |row| row.segments.map(&:last) }
+
+    assert_includes styles, :keyword
+    assert_includes styles, :string
+  end
+
+  def test_results_that_are_not_source_still_render_as_markdown
+    tui = Rubycog::TUI.new(FakeChat.new)
+    entry = { role: :result, text: 'plain *soft* output' }
+
+    styles = tui.send(:body_rows, entry, 60).flat_map { |row| row.segments.map(&:last) }
+
+    assert_includes styles, :italic
+  end
+
+  def test_every_highlighter_style_has_a_colour
+    used = Rubycog::CodeHighlight::STYLE_FOR.values + Rubycog::RubyHighlight::STYLE_FOR.values + [:heading, :code]
+
+    assert_empty used.uniq - Rubycog::TUI::STYLES.keys
   end
 
   private
