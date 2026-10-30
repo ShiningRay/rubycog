@@ -96,4 +96,41 @@ class SourceEditTest < Minitest::Test
     assert_equal 'syntax', result[:stage]
     assert_includes File.read(@path), 'VALUE = 1'
   end
+
+  def test_skips_syntax_check_for_non_ruby_files
+    path = File.join(@dir, 'README.md')
+    File.write(path, "# Title\n")
+
+    result = Rubycog::SourceEdit.apply(
+      path, 'README.md', '# Title', '# Title v2',
+      reason: 'docs', backup_root: File.join(@dir, '.rubycog', 'backups')
+    )
+
+    assert result[:ok]
+    assert_includes result[:syntax], 'not a Ruby file'
+    assert_equal "# Title v2\n", File.read(path)
+  end
+
+  def test_creates_new_docs_file_without_ruby_syntax_check
+    path = File.join(@dir, 'docs', 'env.md')
+    FileUtils.mkdir_p(File.dirname(path))
+
+    result = Rubycog::SourceEdit.apply(
+      path, 'docs/env.md', '', "# Env file\n",
+      reason: 'docs', backup_root: File.join(@dir, '.rubycog', 'backups')
+    )
+
+    assert result[:ok]
+    assert_equal "# Env file\n", File.read(path)
+  end
+
+  def test_still_checks_syntax_of_ruby_files
+    result = Rubycog::SourceEdit.apply(
+      @path, 'lib/rubycog/agent.rb', 'VALUE = 1', 'VALUE = 2',
+      reason: 'test', backup_root: File.join(@dir, '.rubycog', 'backups')
+    )
+
+    assert result[:ok]
+    assert_includes result[:syntax], 'Syntax OK'
+  end
 end

@@ -145,6 +145,23 @@ class AgentTest < Minitest::Test
     assert_equal [{ role: 'user', content: 'hi' }], chat.messages
   end
 
+  def test_reset_eval_drops_persistent_locals
+    tool = Rubycog::EvalTool.new
+    agent = Rubycog::Agent.new(chat: FakeChat.new, tool: tool)
+    tool.execute(code: 'agent_marker = 1')
+
+    agent.reset_eval
+
+    assert_equal 'false', tool.execute(code: 'defined?(agent_marker) ? true : false')
+  end
+
+  def test_isolated_eval_flag_reaches_the_default_tool
+    agent = Rubycog::Agent.new(chat: FakeChat.new, isolated_eval: true)
+    tool = agent.instance_variable_get(:@tools).find { |candidate| candidate.is_a?(Rubycog::EvalTool) }
+
+    refute tool.keep_locals?
+  end
+
   def test_compact_waits_for_an_open_tool_round
     chat = FakeChat.new
     agent = Rubycog::Agent.new(chat: chat)

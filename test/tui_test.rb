@@ -258,9 +258,22 @@ end
     tui.instance_variable_set(:@input, +'/help')
     tui.send(:submit)
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/gc'
+    assert_includes tui.instance_variable_get(:@entries).last[:text], '/reset-eval'
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/session'
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/compact'
     assert_includes tui.instance_variable_get(:@entries).last[:text], '/restart'
+  end
+
+  def test_reset_eval_command_clears_locals
+    called = false
+    agent = Object.new
+    agent.define_singleton_method(:reset_eval) { called = true }
+    tui = Rubycog::TUI.new(agent)
+    tui.instance_variable_set(:@input, +'/reset-eval')
+    tui.send(:submit)
+
+    assert called
+    assert_includes tui.instance_variable_get(:@entries).last[:text], 'eval locals cleared'
   end
 
   def test_compact_command_runs_on_the_worker_thread
@@ -317,6 +330,20 @@ end
     tui.send(:draw_transcript, 20, 60)
 
     assert_includes window.rows.join("\n"), '    b = 2'
+  end
+
+  def test_tool_entries_use_ruby_token_colours
+    mask = tool_row_mask('def size = 42', ruby_pairs: true)
+
+    # 6 = keyword (bold), 18 = method name, 9 = number, code colour = indent.
+    assert_equal Curses.color_pair(6) | Curses::A_BOLD | Curses.color_pair(18) |
+                   Curses.color_pair(9) | Curses.color_pair(Rubycog::TUI::CODE_COLOR), mask
+  end
+
+  def test_tool_entries_keep_one_colour_without_token_pairs
+    mask = tool_row_mask('def size = 42', ruby_pairs: false)
+
+    assert_equal Curses.color_pair(Rubycog::TUI::CODE_COLOR), mask
   end
 
   def test_transcript_rows_are_cached_until_the_text_changes
@@ -835,6 +862,78 @@ end
     assert_includes drawn, 'Ctrl-C cancel'
   end
 
+  # Status pulse. Frames are placed on the monotonic clock, so the tests pin
+  # that clock instead of sleeping.
+  def test_running_status_pulses_through_its_colour_frames
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@pulse_pairs, [10, 11, 12])
+    clock = 0.0
+    tui.define_singleton_method(:monotonic) { clock }
+
+    pairs = Array.new(5) do |step|
+      clock = step * Rubycog::TUI::PULSE_STEP
+      tui.send(:pulse_style).first
+    end
+
+    assert_equal [10, 11, 12, 10, 11], pairs
+    assert_equal Curses::A_BOLD, tui.send(:pulse_style).last
+  end
+
+  def test_running_status_falls_back_to_bold_without_colour_frames
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@pulse_pairs, [])
+
+    assert_equal [0, Curses::A_BOLD], tui.send(:pulse_style)
+  end
+
+  def test_busy_footer_paints_the_status_with_the_pulse_colour
+    tui, window = busy_tui([10, 11, 12])
+    tui.send(:draw_footer, 10, 120)
+    drawn = window.rows.join("\n")
+
+    assert_includes drawn, 'thinking · 3.0s'
+    assert_includes drawn, 'Ctrl-C cancel'
+    assert window.masks[7].anybits?(Curses.color_pair(10) | Curses::A_BOLD)
+  end
+
+  def test_busy_footer_colour_advances_to_the_next_frame
+    tui, window = busy_tui([10, 11, 12])
+    clock = 0.0
+    tui.define_singleton_method(:monotonic) { clock }
+    tui.send(:draw_footer, 10, 120)
+    first = window.masks[7]
+
+    window = FakeWindow.new(10, 120) # masks accumulate, so start from a clean one
+    tui.instance_variable_set(:@window, window)
+    clock = Rubycog::TUI::PULSE_STEP
+    tui.send(:draw_footer, 10, 120)
+
+    refute_equal first, window.masks[7]
+    assert window.masks[7].anybits?(Curses.color_pair(11))
+  end
+
+  def test_idle_footer_stays_uncoloured
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@pulse_pairs, [10, 11, 12])
+    window = FakeWindow.new(10, 120)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_footer, 10, 120)
+
+    assert_equal 0, window.masks[7]
+  end
+
+  # A TUI mid-turn with a fixed set of pulse pairs, plus its fake screen.
+  def busy_tui(frames)
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@busy, true)
+    tui.instance_variable_set(:@status, 'thinking')
+    tui.instance_variable_set(:@pulse_pairs, frames)
+    tui.instance_variable_set(:@turn_started_at, tui.send(:monotonic) - 3)
+    window = FakeWindow.new(10, 120)
+    tui.instance_variable_set(:@window, window)
+    [tui, window]
+  end
+
   def test_live_clock_repaints_only_while_a_turn_runs
     tui = Rubycog::TUI.new(FakeChat.new)
     refute tui.send(:live_tick?)
@@ -909,5 +1008,19 @@ end
 
     assert_equal :restart, tui.send(:submit)
     assert_equal [{ role: :user, text: 'hi', at: at }], saved.first
+  end
+
+  private
+
+  # Draws one tool entry and returns the attribute mask of its code row, with
+  # the token colours either available or refused.
+  def tool_row_mask(code, ruby_pairs:)
+    tui = Rubycog::TUI.new(FakeChat.new)
+    tui.instance_variable_set(:@ruby_pairs, ruby_pairs)
+    tui.instance_variable_get(:@entries) << { role: :tool, text: code }
+    window = FakeWindow.new(20, 60)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_transcript, 20, 60)
+    window.masks[window.rows.index { |text| text.include?(code) }]
   end
 end

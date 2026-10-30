@@ -18,5 +18,6 @@ Gem::Specification.new do |spec|
   spec.require_paths = ['lib']
 
   spec.add_dependency 'curses', '~> 1.7'
+  spec.add_dependency 'dotenv', '~> 3.1'
   spec.add_dependency 'ruby_llm', '~> 2.1'
 end

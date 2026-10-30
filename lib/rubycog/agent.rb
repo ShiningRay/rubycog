@@ -79,10 +79,11 @@ module Rubycog
     end
 
     def initialize(model: nil, chat: nil, tool: nil, tools: nil, session: nil, self_iteration: nil,
-                   compactor: nil)
+                   compactor: nil, isolated_eval: false)
       @model = model
       @tool = tool
       @self_iteration = self_iteration
+      @isolated_eval = isolated_eval
       @tools = tools || (tool ? [tool] : default_tools)
       @session = session
       @compactor = compactor || Compactor.new(model: model)
@@ -94,6 +95,13 @@ module Rubycog
     def reset
       @session&.clear
       @chat = build_chat
+    end
+
+    # Drops eval local variables without touching the conversation. Constants,
+    # globals, threads and open resources created by eval need a restart.
+    def reset_eval
+      @tools.each { |tool| tool.reset if tool.is_a?(EvalTool) }
+      self
     end
 
     def ask(message, &on_event)
@@ -169,7 +177,7 @@ module Rubycog
 
     def default_tools
       [
-        EvalTool.new,
+        EvalTool.new(keep_locals: !@isolated_eval),
         ReadSourceTool.new,
         EditSourceTool.new(self_iteration: @self_iteration),
         RunTestsTool.new(self_iteration: @self_iteration),

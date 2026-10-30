@@ -14,10 +14,18 @@ module Rubycog
   # Curses UI: transcript, input, approvals, session footer and restart.
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
-    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
+    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/reset-eval  drop eval local variables\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
     STATS_INTERVAL = 2.0
     TICK_INTERVAL = 0.25 # footer clock repaint while a turn runs
     CODE_COLOR = 5
+    # Running-status pulse: the footer status word walks a colour ramp so a long
+    # turn visibly breathes instead of looking frozen. Frames advance with the
+    # monotonic clock; TICK_INTERVAL throttles the repaints that show them.
+    PULSE_STEP = 0.3 # seconds per frame
+    PULSE_BASE = 10 # first pair allocated, clear of the label and code pairs
+    PULSE_RAMP_256 = [30, 37, 44, 51, 44, 37].freeze # deep teal up to bright cyan
+    PULSE_RAMP_8 = [Curses::COLOR_BLUE, Curses::COLOR_CYAN,
+                    Curses::COLOR_WHITE, Curses::COLOR_CYAN].freeze
     SEARCH_KEY = 6 # Ctrl-F
     WHEEL_STEP = 3 # rows per wheel notch
     # ncurses stores button n's state in 6-bit slots, press being bit 1. Wheel
@@ -27,8 +35,18 @@ module Rubycog
     WHEEL_SUPPORTED = Curses.const_defined?(:BUTTON5_PRESSED)
     WHEEL_UP = 2 << ((4 - 1) * 6)
     WHEEL_DOWN = 2 << ((5 - 1) * 6)
+    # Ruby token styles for eval code. init_colors allocates the matching
+    # colour pairs; when the terminal refuses them @ruby_pairs turns false and
+    # these styles fall back to the plain code colour.
     STYLES = { code: [CODE_COLOR, 0], heading: [0, Curses::A_BOLD], bold: [0, Curses::A_BOLD],
-               italic: [0, Curses::A_UNDERLINE], inline_code: [CODE_COLOR, 0] }.freeze
+               italic: [0, Curses::A_UNDERLINE], inline_code: [CODE_COLOR, 0],
+               keyword: [6, Curses::A_BOLD], string: [7, 0], comment: [8, 0],
+               number: [9, 0], constant: [16, Curses::A_BOLD], symbol: [17, 0],
+               method: [18, 0] }.freeze
+    RUBY_PAIRS = { keyword: [6, Curses::COLOR_CYAN], string: [7, Curses::COLOR_GREEN],
+                   comment: [8, Curses::COLOR_BLUE], number: [9, Curses::COLOR_YELLOW],
+                   constant: [16, Curses::COLOR_MAGENTA], symbol: [17, Curses::COLOR_RED],
+                   method: [18, Curses::COLOR_CYAN] }.freeze
     LABELS = {
       user: ['You', 1], assistant: ['RubyCog', 2], tool: ['eval', 3],
       result: ['result', 3], error: ['Error', 4], warning: ['Warning', 3],
@@ -71,6 +89,8 @@ module Rubycog
                   "resumed #{turns.size} turns"
                 end
       @streaming = false
+      @pulse_pairs = nil # filled by init_colors when the terminal has colours
+      @ruby_pairs = false # token colours, see init_ruby_pairs
       @yolo = yolo
       @objects = nil
       @memory = nil
@@ -192,6 +212,30 @@ module Rubycog
       Curses.init_pair(3, Curses::COLOR_YELLOW, -1)
       Curses.init_pair(4, Curses::COLOR_RED, -1)
       Curses.init_pair(CODE_COLOR, Curses::COLOR_MAGENTA, -1)
+      @pulse_pairs = init_pulse_pairs
+      @ruby_pairs = init_ruby_pairs
+    end
+
+    # Allocates one pair per Ruby token style; false when the terminal refuses
+    # them, which makes the tokens read as plain code.
+    def init_ruby_pairs
+      RUBY_PAIRS.each_value { |pair, color| Curses.init_pair(pair, color, -1) }
+      true
+    rescue StandardError
+      false
+    end
+
+    # Allocates one colour pair per pulse frame and returns their numbers, or an
+    # empty list when the terminal refuses them (monochrome, too few pairs).
+    def init_pulse_pairs
+      ramp = Curses.colors >= 256 ? PULSE_RAMP_256 : PULSE_RAMP_8
+      ramp.each_with_index.map do |color, index|
+        pair = PULSE_BASE + index
+        Curses.init_pair(pair, color, -1)
+        pair
+      end
+    rescue StandardError
+      []
     end
 
     def normalize_key(key)
@@ -289,6 +333,11 @@ module Rubycog
         text = @self_iteration ? @self_iteration.to_text : 'self-iteration: not configured'
         @entries << { role: :info, text: text }
       when '/gc' then collect_garbage
+      when '/reset-eval'
+        @agent.reset_eval
+        GC.start
+        @entries << { role: :info,
+                      text: 'eval locals cleared and GC ran; methods, constants, globals, threads and open resources may remain' }
       when '/yolo'
         @yolo = !@yolo
         if @yolo
@@ -681,7 +730,7 @@ module Rubycog
       return cached[:rows] if cached && cached[:width] == body && cached[:text] == entry[:text]
 
       styled = if entry[:role] == :tool
-                 Markdown.code_lines(entry[:text], body)
+                 Markdown.ruby_lines(entry[:text], body)
                else
                  Markdown.lines(entry[:text], body)
                end
@@ -692,22 +741,54 @@ module Rubycog
 
     def draw_footer(height, width)
       mode = @yolo ? '  ·  YOLO' : ''
+      y = height - 3
       text = if @approval
-               "Run #{@approval.name}? [y] approve once  [n] deny"
+               draw_plain_footer(y, width, "Run #{@approval.name}? [y] approve once  [n] deny", 3)
              elsif @search
-               search_text
+               draw_plain_footer(y, width, search_text)
              elsif @top
-               scrolled_text
+               draw_plain_footer(y, width, scrolled_text)
              elsif @source_stale
-               'code changed — /restart to apply'
+               draw_plain_footer(y, width, 'code changed — /restart to apply')
              elsif @busy
-               "#{busy_text}#{mode}  ·  Ctrl-C cancel"
+               draw_busy_footer(y, width, mode)
              else
-               idle_footer_text(mode)
+               draw_plain_footer(y, width, idle_footer_text(mode))
              end
-      put(height - 3, 1, text, width - 2, @approval ? 3 : 0)
       draw_stats(height, width, Text.width(text))
       put(height - 2, 0, '─' * width, width, 1)
+    end
+
+    # Draws a footer line in one colour and returns it unchanged, so the caller
+    # can measure it to place the right-hand stats.
+    def draw_plain_footer(y, width, text, color = 0)
+      put(y, 1, text, width - 2, color)
+      text
+    end
+
+    # Running turn's footer: the status word pulses through the colour ramp
+    # while the hints after it stay in the default colour. Returns the full
+    # line so the caller can measure it.
+    def draw_busy_footer(y, width, mode)
+      head = busy_text
+      tail = "#{mode}  ·  Ctrl-C cancel"
+      room = width - 2
+      pair, attribute = pulse_style
+      drawn = Text.slice(head, 0, room)
+      put(y, 1, drawn, room, pair, attribute)
+      used = Text.width(drawn)
+      put(y, 1 + used, tail, room - used)
+      head + tail
+    end
+
+    # Colour pair and attribute for the current pulse frame. Frames come from
+    # the monotonic clock, so the animation keeps its own pace no matter how the
+    # repaints are throttled; without colour pairs the status stays merely bold.
+    def pulse_style
+      frames = @pulse_pairs
+      return [0, Curses::A_BOLD] if frames.nil? || frames.empty?
+
+      [frames[(monotonic / PULSE_STEP).floor % frames.size], Curses::A_BOLD]
     end
 
     # Busy footer text: the current status plus how long the turn has run, so a
@@ -933,11 +1014,19 @@ module Rubycog
         room = max_width - used
         break if room <= 0
 
-        seg_color, seg_attribute = style ? STYLES.fetch(style, [0, 0]) : [color, attribute]
+        seg_color, seg_attribute = style ? style_attributes(style) : [color, attribute]
         chunk = Text.slice(text, 0, room)
         put(y, x + used, chunk, room, seg_color, seg_attribute)
         used += Text.width(chunk)
       end
+    end
+
+    # Colour and attribute for a segment style. Token colours need pairs a
+    # monochrome or pair-starved terminal may not have: those read as code.
+    def style_attributes(style)
+      return STYLES[:code] if !@ruby_pairs && RUBY_PAIRS.key?(style)
+
+      STYLES.fetch(style, [0, 0])
     end
 
     def put(y, x, text, max_width, color = 0, attribute = 0)

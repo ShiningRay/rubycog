@@ -3,6 +3,7 @@ GEM
   specs:
     base64 (0.3.0)
     curses (1.7.0)
+    dotenv (3.2.0)
     drb (2.2.3)
     faraday (2.15.1)
       faraday-net_http (>= 2.0, < 3.6)
@@ -50,6 +51,7 @@ PLATFORMS
 
 DEPENDENCIES
   curses (~> 1.7)
+  dotenv (~> 3.1)
   minitest (~> 6.0)
   minitest-mock (~> 5.27)
   rake (~> 13.3)
@@ -59,6 +61,7 @@ CHECKSUMS
   base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
   bundler (4.0.20) sha256=7978a8ac648767f5e635bc522445b79e80a52b907a39a36c2d8085ed6bc762ae
   curses (1.7.0) sha256=c524ff30704bbd136d68d2731263b31edaf4f236b0cbb9b8dd6c802de3317057
+  dotenv (3.2.0) sha256=e375b83121ea7ca4ce20f214740076129ab8514cd81378161f11c03853fe619d
   drb (2.2.3) sha256=0b00d6fdb50995fe4a45dea13663493c841112e4068656854646f418fda13373
   faraday (2.15.1) sha256=8708154deda739c5e86cc42b74960e23e8491fce0eba9e11639a6a34b1ac288f
   faraday-multipart (1.2.0) sha256=7d89a949693714176f612323ca13746a2ded204031a6ba528adee788694ef757

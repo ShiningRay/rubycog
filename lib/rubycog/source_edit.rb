@@ -7,7 +7,7 @@ require 'time'
 require 'tmpdir'
 
 module Rubycog
-  # Reads and edits RubyCog source files with backups, syntax checks and a
+  # Reads and edits RubyCog source files with backups, Ruby syntax checks and a
   # textual diff. It never decides whether an edit is allowed: callers resolve
   # and validate the path through SourcePath first.
   module SourceEdit
@@ -98,11 +98,20 @@ module Rubycog
       FileUtils.rm_f(tmp) if defined?(tmp) && tmp
     end
 
+    # Checks that Ruby files still parse. Other whitelisted files (Markdown,
+    # README, Gemfile) are not Ruby, so the check is skipped rather than failed.
     def syntax_check(full)
+      return { ok: true, output: 'no syntax check (not a Ruby file)' } unless ruby_file?(full)
+
       output, error, status = Open3.capture3(RbConfig.ruby, '-c', full)
       { ok: status.success?, output: [output, error].reject(&:empty?).join("\n") }
     rescue SystemCallError => e
       { ok: false, output: "#{e.class}: #{e.message}" }
+    end
+
+    # True when the path is Ruby source that ruby -c can parse.
+    def ruby_file?(full)
+      File.extname(full) == '.rb'
     end
 
     def backup_file(full, relative, backup_root)

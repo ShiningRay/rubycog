@@ -36,9 +36,13 @@ export DEEPSEEK_API_KEY='你的 DeepSeek API 密钥'
 bin/rubycog
 # 跳过 eval 审批（危险，仅限可信项目）
 bin/rubycog --yolo
+# 每次 eval 使用独立 binding，局部变量不跨调用
+bin/rubycog --isolated-eval
 ```
 
-密钥只从环境变量读取，不会写入项目或日志。如需其他提供商，可配置 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 或 `OPENROUTER_API_KEY`，并用 `--model` 选择对应模型：
+密钥也可以写在 `.env` 文件里，启动时自动读取（dotenv 解析，支持注释、`export`、引号与行尾注释）。查找顺序是**当前目录 `.env`，然后是 RubyCog 自身的 `.env`**；同一个键以先读到的为准。**已存在的 shell 变量一律优先**，所以临时换密钥仍可只 `export`。`.env` 已在 `.gitignore` 中，不会被提交；改完 `.env` 后输入 `/restart` 即重新读取。
+
+密钥从环境变量或 `.env` 读取，不会写入项目或日志。如需其他提供商，可配置 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY` 或 `OPENROUTER_API_KEY`，并用 `--model` 选择对应模型：
 
 ```sh
 bin/rubycog --model gpt-5-mini
@@ -70,6 +74,7 @@ bin/rubycog --model qwen3
 | `Page Up` / `Page Down` | 滚动历史 |
 | `←` / `→` / `Home` / `End` | 移动输入光标 |
 | `/gc` | 立即回收 VM 内存（`GC.start`），并显示回收的对象数与内存变化 |
+| `/reset-eval` | 丢弃 eval 的局部变量表；常量、全局变量、线程等不会随之清除 |
 | `/clear` | 新建对话（`eval` 的进程内定义仍保留） |
 | `/session` | 显示会话文件路径与已保存的轮数 |
 | `/self` | 显示自我迭代审计（最近编辑与测试） |
@@ -93,9 +98,26 @@ bin/rubycog --model qwen3
 
 会话默认保存在启动目录的 `.rubycog_session.json`，启动时自动恢复，footer 显示 `resumed N turns`；可用 `-s/--session PATH` 或 `RUBYCOG_SESSION` 指定路径。只保存 user/assistant 文本，工具调用不重放；连续 assistant 消息会合并成一轮。会话文件含对话内容，已写入 `.gitignore` 且权限设为 0600，仍不要提交或分享。
 
+一轮任务运行期间，footer 的状态词（`thinking`、`cancelling`、`compacting`）会沿颜色阶梯脉动，后面跟着该轮已用时间（`thinking · 0.6s`）；结束后耗时留在该轮应答的标签行（`RubyCog · 14:32 · 42s`）。等审批时页脚被固定的黄色提示接管，不参与脉动。颜色阶梯在 256 色终端上是 6 帧青色渐变，8 色终端降为 4 帧亮度阶梯，无色终端只保留加粗。帧由单调时钟推进，重绘仍受 `TICK_INTERVAL`（0.25s）节流，空闲时不重绘。
+
+`eval` 收到的代码在转录区按 Ruby 语法高亮：关键字（青色加粗）、字符串（绿色）、注释（蓝色）、数字（黄色）、常量（品红加粗）、符号（红色）、`def` 后的方法名（青色）。这是逐行的显示辅助而非解析器：未闭合的字符串、插值、`%w[]` 字面量只会少一层颜色，文本不会变；换行与缩进和纯代码渲染完全相同，因此搜索和滚动行为不受影响。终端没有颜色或颜色对不足时，自动退回统一的代码色。
+
+助手消息里标注了语言的围栏代码块也走同一套高亮：```` ```ruby ````（或 ```` ```rb ````）按 Ruby 上色，其它语言和未标注的围栏保持纯代码色——把 `json`、`sh` 当 Ruby 猜会让 `if`/`then`/`end` 亮错地方。围栏标记支持尾随参数（如 ```` ```ruby title=demo ````），大小写不敏感。
+
 修改 RubyCog 自身源码后，当前进程仍运行旧类。模型应先跑相关测试，再明确提示重启；TUI 检测到 `lib/**/*.rb` 变化时 footer 会显示 `code changed — /restart to apply`。按 `/restart` 保存会话并重启，新的进程才会加载改动。
 
-自我迭代与源码检索使用这些工具：`eval` 执行 Ruby；`read_source` 读取白名单源码；`search_docs` 按关键词搜索类/方法上方的文档注释；`get_doc` 读取注释；`get_source` 读取方法源码；`edit_source` 做唯一匹配替换（审批、备份、`ruby -c`、失败回滚）；`run_tests` 跑指定或全量测试（审批、超时、输出截断）。写入只允许 `lib/`、`test/`、`docs/`、`bin/rubycog`、`README.md`、`Gemfile`、`rubycog.gemspec`；`.git`、`.env`、密钥、`.rubycog/`、`Gemfile.lock` 禁止；编辑器与路径守卫本身不可自我写入。每次编辑与测试记录在 `.rubycog/self_iteration.json`，用 `/self` 查看。机制细节见 [docs/self-iteration.md](docs/self-iteration.md)，源码文档检索见 [docs/source-docs.md](docs/source-docs.md)。
+自我迭代与源码检索使用这些工具：`eval` 执行 Ruby；`read_source` 读取白名单源码；`search_docs` 按关键词搜索类/方法上方的文档注释；`get_doc` 读取注释；`get_source` 读取方法源码；`edit_source` 做唯一匹配替换（审批、备份、Ruby 文件跑 `ruby -c`、失败回滚）；`run_tests` 跑指定或全量测试（审批、超时、输出截断）。写入只允许 `lib/`、`test/`、`docs/`、`bin/rubycog`、`README.md`、`Gemfile`、`rubycog.gemspec`；`.git`、`.env`、密钥、`.rubycog/`、`Gemfile.lock` 禁止；编辑器与路径守卫本身不可自我写入。每次编辑与测试记录在 `.rubycog/self_iteration.json`，用 `/self` 查看。机制细节见 [docs/self-iteration.md](docs/self-iteration.md)，源码文档检索见 [docs/source-docs.md](docs/source-docs.md)。
+
+## eval 内存与会话隔离
+
+默认模式下，`eval` 的局部变量在当前进程中保留，跨调用可复用。这些变量由 binding 持有，直到重置或进程退出；大量临时对象会一直可达，`GC.start` 不会回收。
+
+- `/reset-eval`：丢弃当前 eval 局部变量表并触发 GC。旧 binding 失去引用后，仅被它引用的对象可以被回收。
+- `--isolated-eval`：每次 `eval` 使用新的 binding，局部变量、局部方法和 `self` 都不跨调用；适合一次性脚本。
+- 方法、常量与类（默认落在 `Object`）、全局变量、线程、信号处理器、打开的文件/连接不会因 `/reset-eval` 清除；需要彻底清理时重启进程。
+- `/gc` 只触发 GC；`/restart` 会重启进程并恢复会话文本。
+
+隔离模式每次调用的 `self` 是匿名对象，不是 `main`；默认模式仍保持 `main`。
 
 ## 安全说明
 

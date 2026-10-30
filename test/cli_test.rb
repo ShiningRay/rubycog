@@ -62,4 +62,18 @@ class CLITest < Minitest::Test
     end
     assert_equal false, captured
   end
+
+  def test_isolated_eval_flag_reaches_the_agent
+    captured = nil
+    tui = Object.new
+    tui.define_singleton_method(:run) {}
+
+    Rubycog::Agent.stub(:new, ->(**options) { captured = options; Object.new }) do
+      Rubycog::TUI.stub(:new, ->(_agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: []) { tui }) do
+        assert_equal 0, Rubycog::CLI.start(['--isolated-eval'])
+      end
+    end
+
+    assert_equal true, captured[:isolated_eval]
+  end
 end

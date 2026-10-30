@@ -57,4 +57,22 @@ class EvalToolTest < Minitest::Test
   def test_interrupt_is_not_swallowed
     assert_raises(Interrupt) { @tool.execute(code: 'raise Interrupt') }
   end
+
+  def test_isolated_mode_drops_locals_between_calls
+    tool = Rubycog::EvalTool.new(keep_locals: false)
+    tool.execute(code: 'isolated_marker = 1')
+
+    assert_equal 'false', tool.execute(code: 'defined?(isolated_marker) ? true : false')
+  end
+
+  def test_reset_drops_persistent_locals
+    @tool.execute(code: 'reset_marker = 1')
+    @tool.reset
+
+    assert_equal 'false', @tool.execute(code: 'defined?(reset_marker) ? true : false')
+  end
+
+  def test_keep_locals_is_on_by_default
+    assert @tool.keep_locals?
+  end
 end

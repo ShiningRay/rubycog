@@ -14,7 +14,8 @@ module Rubycog
       Edit one RubyCog source file by replacing an exact string. The path must
       be in the project whitelist. old_string must match exactly once; pass an
       empty old_string to create a new test/ or docs/ file. After writing, the
-      tool runs ruby -c and restores the backup if syntax is broken. Run
+      tool runs ruby -c on Ruby files and restores the backup if the syntax is
+      broken. Run
       run_tests afterwards and tell the user a restart is required.
     DESCRIPTION
 

@@ -3,6 +3,7 @@
 source 'https://rubygems.org'
 
 gem 'curses', '~> 1.7'
+gem 'dotenv', '~> 3.1'
 gem 'ruby_llm', '~> 2.1'
 
 group :development, :test do
