@@ -14,7 +14,7 @@ module Rubycog
   # Curses UI: transcript, input, approvals, session footer and restart.
   class TUI
     WELCOME = 'A tiny Ruby agent. Ask anything; use Ruby through eval.'
-    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/gc    free VM memory (run GC)\n/reset-eval  drop eval local variables\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/experiences  list learned external patterns\n/proposals  list evolution proposals\n/evolve  drive one self-evolution loop\n/introspect  scan for code smells and propose cleanups\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
+    HELP = "/help  this help\n/yolo  toggle automatic tool approval\n/idle [on|off|status]  idle-triggered evolution/introspection\n/gc    free VM memory (run GC)\n/reset-eval  drop eval local variables\n/session  show session file and turns\n/compact  summarize the history to free context\n/self  show self-iteration history\n/experiences  list learned external patterns\n/proposals  list evolution proposals\n/evolve  drive one self-evolution loop\n/introspect  scan for code smells and propose cleanups\n/restart  save and restart to load new code\n/clear  new conversation\n/quit   exit\nCtrl-F  search the transcript"
     STATS_INTERVAL = 2.0
     TICK_INTERVAL = 0.25 # footer clock repaint while a turn runs
     CODE_COLOR = 5
@@ -103,6 +103,8 @@ module Rubycog
       @shown_code = nil
       @source_digest = source_snapshot
       @source_stale = false
+      @idle_watcher = nil
+      @idle_enabled = false
     end
 
     def run
@@ -118,6 +120,7 @@ module Rubycog
       init_colors
       enable_mouse
       start_stats_sampler
+      start_idle_watcher
       draw
 
       action = nil
@@ -133,6 +136,7 @@ module Rubycog
         draw if key || changed || live_tick?
       end
     ensure
+      stop_idle_watcher
       if @busy
         @agent.cancel
         @worker&.join(1)
@@ -297,6 +301,7 @@ module Rubycog
     end
 
     def submit
+      @idle_watcher&.notify_activity
       message = @input.strip
       if message.empty?
         @top = nil # an empty Enter jumps back to the newest output
@@ -401,6 +406,8 @@ module Rubycog
         else
           @entries << { role: :info, text: 'YOLO off: eval requires approval.' }
         end
+      when %r{\A/idle\b}
+        handle_idle_command(message)
       else
         @entries << { role: :user, text: message, at: Time.now }
         start_turn
@@ -428,6 +435,122 @@ module Rubycog
       @events << { type: :error, payload: "#{e.class}: #{e.message}" }
     ensure
       @events << { type: :done, payload: nil }
+    end
+
+    # -- idle watcher ------------------------------------------------------
+
+    def start_idle_watcher
+      return if @idle_watcher
+
+      @idle_watcher = IdleWatcher.new(on_fire: method(:on_idle_fire))
+      @idle_watcher.start
+      @idle_enabled = true
+    end
+
+    def stop_idle_watcher
+      @idle_watcher&.stop
+      @idle_watcher = nil
+      @idle_enabled = false
+    end
+
+    # Called on the watcher thread when the idle threshold is reached. We
+    # must NOT touch curses from this thread; instead we kick off a worker
+    # exactly like `submit` does, then return. The main loop picks up the
+    # resulting events as usual.
+    def on_idle_fire(action)
+      return if @busy
+      return if @approval # a pending approval counts as user engagement
+
+      message = idle_message_for(action)
+      @events << { type: :info,
+                   payload: "idle #{@idle_watcher.idle_threshold}s reached — starting #{action} (yolo=#{@yolo})" }
+      @entries << { role: :user, text: message, at: Time.now }
+      start_turn
+      @busy = true
+      @status = "idle #{action}"
+      @top = nil
+      @worker = Thread.new { converse(message) }
+    end
+
+    def idle_message_for(action)
+      case action
+      when :evolve
+        if @yolo
+          <<~PROMPT.strip
+            [idle-triggered evolution] Drive one self-evolution loop on RubyCog:
+              1. suggest_proposals to find experiences no proposal has referenced yet.
+              2. Pick the most valuable one and propose_evolution with title, motivation,
+                 touches, test_plan, and a tight budget.
+              3. approve_proposal, then run_evolution.
+              4. Inside the worktree, evolution_edit (budget enforced), evolution_run_tests,
+                 evolution_benchmark.
+              5. finish_evolution with notes. Do NOT merge — wait for my review.
+            If there are no unreferenced experiences, say so and stop.
+          PROMPT
+        else
+          <<~PROMPT.strip
+            [idle-triggered evolution — proposal only] The user is away. Do NOT approve,
+            run, edit, test, or merge anything. Only:
+              1. suggest_proposals to find unreferenced experiences.
+              2. propose_evolution for the single most valuable one.
+            Then stop and wait for the user to return.
+          PROMPT
+        end
+      when :introspect
+        if @yolo
+          <<~PROMPT.strip
+            [idle-triggered introspection] Run one self-introspection pass on RubyCog:
+              1. introspect_code to scan lib/.
+              2. read_source the top offenders.
+              3. Pick the single most impactful smell or perf opportunity, propose_evolution
+                 with category=refactor or category=performance and a tight budget.
+              4. approve_proposal, run_evolution, evolution_edit, evolution_run_tests,
+                 evolution_benchmark, finish_evolution. Do NOT merge.
+            Stop after one proposal completes.
+          PROMPT
+        else
+          <<~PROMPT.strip
+            [idle-triggered introspection — proposal only] The user is away. Do NOT approve,
+            run, edit, test, or merge anything. Only:
+              1. introspect_code to scan lib/.
+              2. read_source the top offenders.
+              3. propose_evolution with category=refactor or category=performance for the
+                 single most valuable smell or perf opportunity.
+            Then stop and wait for the user to return.
+          PROMPT
+        end
+      end
+    end
+
+    def handle_idle_command(message)
+      arg = message.split(/\s+/, 2)[1].to_s.strip
+      case arg
+      when '', 'status'
+        @entries << { role: :info, text: idle_status_report }
+      when 'on'
+        start_idle_watcher
+        @entries << { role: :info, text: 'idle watcher on (15 min trigger, 60 min cooldown)' }
+      when 'off'
+        stop_idle_watcher
+        @entries << { role: :info, text: 'idle watcher off' }
+      else
+        @entries << { role: :info, text: "usage: /idle [on|off|status]" }
+      end
+    end
+
+    def idle_status_report
+      return 'idle watcher: off (use /idle on to enable)' unless @idle_watcher&.running?
+
+      w = @idle_watcher
+      lines = []
+      lines << 'idle watcher: on'
+      lines << format('  idle for: %ds / threshold %ds', w.idle_for.round, w.idle_threshold)
+      cd = w.cooldown_remaining
+      lines << format('  cooldown: %ds remaining', cd.round) if cd.positive?
+      lines << format('  time to next fire: %ds', w.time_to_fire.round) if w.time_to_fire.finite?
+      lines << "  next action: #{w.next_action}"
+      lines << "  yolo: #{@yolo} (#{@yolo ? 'full loop' : 'proposal only'})"
+      lines.join("\n")
     end
 
     def compact_conversation
