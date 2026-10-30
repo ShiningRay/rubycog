@@ -59,6 +59,7 @@ module Rubycog
 
     def initialize(agent, yolo: false, history: [], session: nil, self_iteration: nil, argv: ARGV)
       @agent = agent
+      @name = Rubycog.name
       @session = session
       @self_iteration = self_iteration
       @argv = argv.dup
@@ -679,12 +680,27 @@ module Rubycog
       # A resize can invalidate a draw between measuring and writing.
     end
 
+    # Header row: display name, model and working directory.
+    #
+    # The name is configurable (--name or RUBYCOG_NAME), so the model is placed
+    # from the name's measured width instead of a fixed column, and a long name
+    # is shortened rather than allowed to push the model off the row.
     def draw_header(width)
       model = @agent.chat.model.id
-      put(0, 1, 'RubyCog', width - 2, 2, Curses::A_BOLD)
-      put(0, 10, model, width - 11, 0)
-      draw_cwd(width, 10 + Text.width(model) + 2)
+      name = header_name(width - 2 - Text.width(model) - 2)
+      put(0, 1, name, width - 2, 2, Curses::A_BOLD)
+      left = 1 + Text.width(name) + 2
+      put(0, left, model, width - 1 - left, 0)
+      draw_cwd(width, left + Text.width(model) + 2)
       put(1, 0, '─' * width, width, 1)
+    end
+
+    # Keeps the head of a long name and marks the cut with an ellipsis, so a
+    # custom name cannot hide the model beside it.
+    def header_name(room)
+      return @name if room < 2 || Text.width(@name) <= room
+
+      "#{Text.slice(@name, 0, room - 1)}…"
     end
 
     def draw_cwd(width, left)
@@ -734,6 +750,7 @@ module Rubycog
       return cached[:triples] if cached && cached[:rows].equal?(body)
 
       label, color = LABELS.fetch(entry[:role])
+      label = @name if entry[:role] == :assistant
       label = label_parts(label, entry).join(' · ')
       triples = [[Markdown::Row.new([[+label, nil]]), color, Curses::A_BOLD]] +
                 body.map { |row| [row, 0, 0] } +

@@ -101,6 +101,42 @@ class TUITest < Minitest::Test
     assert_equal '', tui.send(:truncate_path, '/very/long/path', 1)
   end
 
+  def test_header_shows_the_configured_name
+    with_name('Coglet') do
+      window = header_window
+      row = window.rows[0]
+      assert_equal 'Coglet', row[1, 6]
+      assert_includes row, 'fake-model'
+      refute_includes row, 'RubyCog'
+    end
+  end
+
+  def test_long_name_is_shortened_so_the_model_stays_visible
+    with_name('C' * 200) do
+      window = header_window(width: 40)
+      row = window.rows[0]
+      assert_includes row, '…'
+      assert_includes row, 'fake-model'
+      assert_operator Rubycog::Text.width(row.strip), :<=, 40
+    end
+  end
+
+  def test_assistant_label_uses_the_configured_name
+    with_name('Coglet') do
+      tui = Rubycog::TUI.new(FakeChat.new)
+      rows = tui.send(:entry_rows, { role: :assistant, text: 'hi' }, 60)
+      assert_equal 'Coglet', rows[0][0].text
+    end
+  end
+
+  def test_other_roles_keep_their_own_labels
+    with_name('Coglet') do
+      tui = Rubycog::TUI.new(FakeChat.new)
+      rows = tui.send(:entry_rows, { role: :user, text: 'hi' }, 60)
+      assert_equal 'You', rows[0][0].text
+    end
+  end
+
   def test_yolo_auto_approves_without_waiting
     tui = Rubycog::TUI.new(FakeChat.new, yolo: true)
     assert_equal true, tui.send(:resolve_approval, Object.new)
@@ -1069,6 +1105,25 @@ end
   end
 
   private
+
+  # Sets the display name for one test and restores the default afterwards.
+  def with_name(name)
+    Rubycog.name = name
+    yield
+  ensure
+    Rubycog.name = nil
+  end
+
+  # Draws the header into a fake window and returns it, so tests can inspect the
+  # row a custom name produces.
+  def header_window(width: 120)
+    agent = Struct.new(:chat).new(FakeChat.new)
+    tui = Rubycog::TUI.new(agent)
+    window = FakeWindow.new(10, width)
+    tui.instance_variable_set(:@window, window)
+    tui.send(:draw_header, width)
+    window
+  end
 
   # Draws one tool entry and returns the attribute mask of its code row, with
   # the token colours either available or refused.

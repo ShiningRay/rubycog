@@ -64,6 +64,20 @@ bin/rubycog --model qwen3
 
 试试输入：`Use Ruby to calculate 21 * 2.`
 
+## 自定义名字
+
+表头和助手消息的标签默认显示 `RubyCog`，可以用 `--name` 或 `RUBYCOG_NAME` 换成别的名字：
+
+```sh
+bin/rubycog --name 'Coglet'
+# 或者长期生效
+export RUBYCOG_NAME='Coglet'
+```
+
+优先级是 `--name` 高于 `RUBYCOG_NAME`，都不给则用默认值；也可以写在 `.env` 里。空字符串或纯空白会退回默认值，控制字符（换行、制表符）会被去掉，以免画歪表头。名字过长时从尾部截断并加省略号，右边的模型名与路径不会被挤掉。`/restart` 会原样带上命令行参数和环境变量，改名后重启仍然生效。
+
+只有界面文字会变；系统提示词和工具说明里仍然写 RubyCog，那指的是项目本身。
+
 ## 操作
 
 | 按键 / 命令 | 行为 |

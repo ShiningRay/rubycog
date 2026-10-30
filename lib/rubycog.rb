@@ -1,8 +1,32 @@
 # frozen_string_literal: true
 
 module Rubycog
+  # Name the UI shows when nothing overrides it.
+  DEFAULT_NAME = 'RubyCog'
+  # Environment variable that overrides the display name.
+  NAME_ENV = 'RUBYCOG_NAME'
+
   def self.root
     File.expand_path('..', __dir__)
+  end
+
+  # Display name for the header and the assistant transcript label.
+  #
+  # Defaults to DEFAULT_NAME. `--name` and NAME_ENV change it, so a fork, or a
+  # second persona on the same machine, does not have to edit code to be called
+  # something else. The agent's instructions and tool descriptions still say
+  # RubyCog: they name the project, not the speaker.
+  def self.name
+    @name || DEFAULT_NAME
+  end
+
+  # Sets the display name; nil or blank restores DEFAULT_NAME.
+  #
+  # Control characters are dropped because the name is written straight into a
+  # curses line, where a newline or tab would corrupt the header.
+  def self.name=(value)
+    text = value.to_s.gsub(/[[:cntrl:]]/, '').strip
+    @name = text.empty? ? nil : text
   end
 end
 

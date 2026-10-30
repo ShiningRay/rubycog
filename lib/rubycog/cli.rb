@@ -54,7 +54,7 @@ module Rubycog
       original_argv = argv.dup
       options = { yolo: false }
       parser = OptionParser.new do |opts|
-        opts.banner = 'Usage: rubycog [--model MODEL] [--session PATH] [--yolo] [--isolated-eval]'
+        opts.banner = 'Usage: rubycog [--model MODEL] [--session PATH] [--name NAME] [--yolo] [--isolated-eval]'
         opts.on('-m', '--model MODEL', 'RubyLLM model ID (or RUBYCOG_MODEL)') do |model|
           options[:model] = model
         end
@@ -63,6 +63,9 @@ module Rubycog
         end
         opts.on('-s', '--session PATH', 'Conversation file (or RUBYCOG_SESSION)') do |path|
           options[:session] = path
+        end
+        opts.on('-n', '--name NAME', 'Name shown in the UI (or RUBYCOG_NAME)') do |name|
+          options[:name] = name
         end
         opts.on('--isolated-eval', 'Drop eval local variables after every call') do
           options[:isolated_eval] = true
@@ -79,6 +82,7 @@ module Rubycog
       parser.parse!(argv)
 
       EnvFile.load
+      Rubycog.name = options[:name] || ENV[Rubycog::NAME_ENV]
       Agent.configure
       session = Session.new(options[:session] || Session.default_path)
       iteration = SelfIteration.new
