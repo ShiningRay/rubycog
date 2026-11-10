@@ -20,4 +20,6 @@ end
 
 require_relative '../lib/rubycog'
 
-Rubycog::CLI.start(ARGV)
+# Propagate the CLI status: a supervisor running headless mode needs to see a
+# failed one-shot task (1), not the shell's default success.
+exit Rubycog::CLI.start(ARGV)

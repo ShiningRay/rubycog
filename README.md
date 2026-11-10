@@ -64,6 +64,44 @@ bin/rubycog --model qwen3
 
 试试输入：`Use Ruby to calculate 21 * 2.`
 
+## 无终端运行（headless）
+
+没有终端或 curses 不可用时，可以让看门狗托管 headless 模式。它使用同一个 Agent、工具与会话文件，但不加载 curses：
+
+```sh
+# 回答一个问题后退出
+bin/rubycog --task 'Use Ruby to calculate 21 * 2'
+
+# 常驻：按文件名顺序轮询 inbox 里的 *.txt
+bin/rubycog --headless --daemon \
+  --inbox .rubycog/headless/inbox \
+  --heartbeat .rubycog/headless/heartbeat.json \
+  --interval 5
+```
+
+stdout 是逐行的纯文本事件流（`[status]`、`[tool]`、`[result]`、`[error]`、`[done]`，模型回答原样流式输出），启动横幅写到 stderr。headless 没有可交互的人，因此**所有工具调用都会自动批准**（等价于 `--yolo`，每次批准记一行 `[approval]`），只应在可信目录中使用。
+
+`--task` 只跑一轮就退出；`--daemon` 缺少 `--task` 时进入轮询循环。守护进程启动时创建 `inbox/`、`inbox/done/`、`inbox/failed/`，每个 tick 处理 `*.txt`：成功移到 `done/`，失败移到 `failed/`，单个任务抛错不会终止循环；每个 tick 原子重写心跳 JSON（`pid`、`started_at`、`last_tick`、`tasks_done`）。SIGINT/SIGTERM 会等当前任务跑完后退出；任务处理之外的致命错误打印 backtrace 并以退出码 1 结束。会话仍由 `-s/--session` 指定，和 TUI 共用。详见 [docs/headless.md](docs/headless.md)。
+
+## 崩溃监控与 AI 修复
+
+`scripts/watchdog.rb` 负责拉起并盯着 rubycog：子进程非正常退出时，它把退出码、
+运行日志末尾和 git 状态写进 `.rubycog/watchdog/crashes/<时间戳>/`，然后执行
+修复命令，再重新拉起进程。
+
+```sh
+ruby scripts/watchdog.rb \
+  --repair 'ruby scripts/dsh_repair.rb --report %{report} --timeout 900' \
+  --max-restarts 5 --stable-seconds 120 \
+  -- ruby bin/rubycog --headless --daemon
+```
+
+`scripts/dsh_repair.rb` 把崩溃报告拼成提示词交给 `dsh headless`，由 AI 复现、
+定位、改代码并跑测试；修复命令返回 0 才重启，否则保留现场停下。状态写在
+`.rubycog/watchdog/status.json`，修复过程在同目录的 `repair.log`。
+托管命令里不要套 `bundle exec`（Windows 上信号传不下去），模型 key 放在被
+忽略的 `.env` 里。完整步骤与限制见 [docs/supervision.md](docs/supervision.md)。
+
 ## 自定义名字
 
 表头和助手消息的标签默认显示 `RubyCog`，可以用 `--name` 或 `RUBYCOG_NAME` 换成别的名字：

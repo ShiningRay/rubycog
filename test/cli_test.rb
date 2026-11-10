@@ -3,6 +3,7 @@
 require_relative 'test_helper'
 require 'stringio'
 require 'minitest/mock'
+require 'tmpdir'
 
 class CLITest < Minitest::Test
   def test_help
@@ -121,7 +122,63 @@ class CLITest < Minitest::Test
     assert_includes output.string, '--name NAME'
   end
 
+  def test_help_lists_the_headless_options
+    output = StringIO.new
+    assert_equal 0, Rubycog::CLI.start(['--help'], stdout: output)
+    %w[--headless --task --daemon --inbox --heartbeat --interval].each do |flag|
+      assert_includes output.string, flag
+    end
+  end
+
+  def test_task_flag_routes_to_headless
+    seen = capture_headless(['--task', 'hello'])
+
+    assert_equal 'hello', seen[:run][:task]
+    assert_equal false, seen[:run][:daemon]
+  end
+
+  def test_headless_daemon_passes_the_inbox_settings
+    Dir.mktmpdir('rubycog-cli') do |dir|
+      inbox = File.join(dir, 'inbox')
+      heartbeat = File.join(dir, 'heartbeat.json')
+      seen = capture_headless(['--headless', '--daemon', '--inbox', inbox,
+                               '--heartbeat', heartbeat, '--interval', '0.25'])
+
+      assert_nil seen[:run][:task]
+      assert_equal true, seen[:run][:daemon]
+      assert_equal inbox, seen[:options][:inbox]
+      assert_equal heartbeat, seen[:options][:heartbeat]
+      assert_in_delta 0.25, seen[:options][:interval]
+    end
+  end
+
+  def test_headless_without_task_or_daemon_explains_itself
+    error = StringIO.new
+
+    assert_equal 1, Rubycog::CLI.start(['--headless'], stderr: error)
+
+    assert_includes error.string, '--task'
+    assert_includes error.string, '--daemon'
+  end
+
   private
+
+  # Stubs the agent and the headless runner, returning what the CLI passed to
+  # each: `run` gets the mode, `options` the inbox/heartbeat/interval settings.
+  def capture_headless(argv)
+    seen = {}
+    runner = Object.new
+    runner.define_singleton_method(:run) do |task: nil, daemon: false|
+      seen[:run] = { task: task, daemon: daemon }
+      0
+    end
+    Rubycog::Agent.stub(:new, ->(**_options) { Object.new }) do
+      Rubycog::Headless.stub(:new, ->(_agent, **options) { seen[:options] = options; runner }) do
+        assert_equal 0, Rubycog::CLI.start(argv)
+      end
+    end
+    seen
+  end
 
   # Runs the real CLI with the agent and the curses UI stubbed out, so only the
   # option handling and the name resolution actually run.

@@ -216,7 +216,7 @@ module Rubycog
 
     def summarize(turns)
       prompt = "#{PROMPT}\n\n--- transcript ---\n#{transcript(turns)}"
-      text = RubyLLM.chat(model: @model).ask(prompt).content.to_s.strip
+      text = RubyLLM.chat(**ChatFactory.options(model: @model)).ask(prompt).content.to_s.strip
       text.empty? ? nil : text
     end
 

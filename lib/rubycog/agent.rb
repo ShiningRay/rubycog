@@ -200,7 +200,8 @@ module Rubycog
     end
 
     def build_chat
-      RubyLLM.chat(model: @model).with_instructions(INSTRUCTIONS).with_tools(*@tools)
+      RubyLLM.chat(**ChatFactory.options(model: @model))
+             .with_instructions(INSTRUCTIONS).with_tools(*@tools)
     end
 
     def default_tools
