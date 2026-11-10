@@ -77,7 +77,7 @@ module Rubycog
       error = +''
       status = nil
 
-      Open3.popen3(*command_for(files), chdir: @root, pgroup: true) do |stdin, stdout, stderr, wait|
+      Open3.popen3(*command_for(files), chdir: @root, **process_group_options) do |stdin, stdout, stderr, wait|
         stdin.close
         readers = [
           Thread.new { output << stdout.read },
@@ -86,7 +86,7 @@ module Rubycog
         begin
           status = Timeout.timeout(@timeout) { wait.value }
         rescue Timeout::Error
-          Process.kill('TERM', -wait.pid)
+          kill_process_group(wait.pid)
           status = wait.value
           return { ok: false, exit_status: nil,
                    output: trim("timeout after #{@timeout}s\n#{output}\n#{error}") }
@@ -105,5 +105,26 @@ module Rubycog
       value = text.to_s
       value.length > 4_000 ? "#{value[0, 4_000]}\n… (truncated)" : value
     end
+
+    # Windows rejects the pgroup spawn option outright, so the process group is
+    # only requested where the platform implements it.
+    def process_group_options
+      return {} if Gem.win_platform?
+
+      { pgroup: true }
+    end
+
+    # Kills the whole test process group so a hanging child cannot survive the
+    # timeout; Windows has no group to signal, so only the child is killed.
+    def kill_process_group(pid)
+      if Gem.win_platform?
+        Process.kill('KILL', pid)
+      else
+        Process.kill('TERM', -pid)
+      end
+    rescue SystemCallError
+      nil
+    end
+
   end
 end

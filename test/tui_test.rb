@@ -807,7 +807,12 @@ end
   end
 
   # Delivers a mouse event the way curses does: KEY_MOUSE, then Curses.getmouse.
+  # PDCurses ships without mouse decoding, so these tests skip on such builds.
   def wheel(tui, bstate)
+    unless Curses.respond_to?(:getmouse) && Curses.const_defined?(:KEY_MOUSE)
+      skip 'this curses build has no mouse decoding'
+    end
+
     event = Struct.new(:bstate).new(bstate)
     Curses.stub(:getmouse, event) { tui.send(:handle_key, Curses::KEY_MOUSE) }
   end
@@ -832,6 +837,8 @@ end
   end
 
   def test_other_mouse_events_are_ignored
+    skip 'this curses build has no BUTTON1_PRESSED' unless Curses.const_defined?(:BUTTON1_PRESSED)
+
     tui, window = scrolling_tui
     redraw_transcript(tui, window)
     wheel(tui, Curses::BUTTON1_PRESSED)
@@ -855,6 +862,8 @@ end
   end
 
   def test_mouse_reporting_is_enabled_only_when_both_wheel_directions_decode
+    skip 'this curses build has no mousemask' unless Curses.respond_to?(:mousemask)
+
     tui = Rubycog::TUI.new(FakeChat.new)
     masks = []
     Curses.stub(:mousemask, ->(mask) { masks << mask; 0 }) { tui.send(:enable_mouse) }

@@ -133,6 +133,15 @@ module Rubycog
     end
 
     def unified_diff(before, after, relative)
+      external = external_diff(before, after, relative)
+      return external if external
+
+      fallback_diff(before, after, relative)
+    end
+
+    # Runs the platform `diff` when it exists; nil means the caller has to
+    # render the diff itself, which is the normal case on Windows.
+    def external_diff(before, after, relative)
       Dir.mktmpdir('rubycog-diff') do |dir|
         old_path = File.join(dir, 'before')
         new_path = File.join(dir, 'after')
@@ -141,11 +150,44 @@ module Rubycog
         output, = Open3.capture2e(
           'diff', '-u', '-L', "a/#{relative}", '-L', "b/#{relative}", old_path, new_path
         )
-        return output unless output.empty?
+        return output unless output.strip.empty?
       end
-      "--- a/#{relative}\n+++ b/#{relative}\n(diff unavailable)\n"
+      nil
     rescue SystemCallError
-      "--- a/#{relative}\n+++ b/#{relative}\n(diff command unavailable)\n"
+      nil
+    end
+
+    # Renders a unified diff without an external program. Common prefix and
+    # suffix lines are dropped so only the changed region is shown; that is a
+    # valid hunk and enough for the audit trail and the self-iteration record.
+    def fallback_diff(before, after, relative)
+      old_lines = before.to_s.lines
+      new_lines = after.to_s.lines
+      prefix = common_prefix(old_lines, new_lines)
+      suffix = common_suffix(old_lines, new_lines, prefix)
+      removed = old_lines[prefix...(old_lines.length - suffix)] || []
+      added = new_lines[prefix...(new_lines.length - suffix)] || []
+
+      header = "--- a/#{relative}\n+++ b/#{relative}\n"
+      return header if removed.empty? && added.empty?
+
+      hunk = "@@ -#{prefix + 1},#{removed.length} +#{prefix + 1},#{added.length} @@\n"
+      body = removed.map { |line| "-#{line}" }.join + added.map { |line| "+#{line}" }.join
+      "#{header}#{hunk}#{body}"
+    end
+
+    def common_prefix(old_lines, new_lines)
+      limit = [old_lines.length, new_lines.length].min
+      index = 0
+      index += 1 while index < limit && old_lines[index] == new_lines[index]
+      index
+    end
+
+    def common_suffix(old_lines, new_lines, prefix)
+      limit = [old_lines.length, new_lines.length].min - prefix
+      count = 0
+      count += 1 while count < limit && old_lines[-1 - count] == new_lines[-1 - count]
+      count
     end
   end
 end

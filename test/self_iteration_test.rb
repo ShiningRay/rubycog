@@ -24,6 +24,7 @@ class SelfIterationTest < Minitest::Test
     assert_includes iteration.summary, 'last test passed'
     assert_includes iteration.to_text, 'edit'
     assert_includes iteration.to_text, 'test'
+    skip 'file modes are not reported on Windows' if Gem.win_platform?
     assert_equal 0o600, File.stat(@path).mode & 0o777
   end
 
@@ -133,3 +134,4 @@ class SelfIterationToolsTest < Minitest::Test
     assert_includes output, 'run_tests error'
   end
 end
+

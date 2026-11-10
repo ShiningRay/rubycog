@@ -89,7 +89,9 @@ class SessionTest < Minitest::Test
   def test_env_var_overrides_the_default_path
     path = Rubycog::Session.default_path(env: { 'RUBYCOG_SESSION' => '/tmp/custom.json' })
 
-    assert_equal '/tmp/custom.json', path
+    # The override goes through File.expand_path, which prefixes the drive on
+    # Windows, so the expected value is expanded the same way.
+    assert_equal File.expand_path('/tmp/custom.json'), path
   end
 
   def test_records_when_each_turn_was_written

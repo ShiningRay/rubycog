@@ -48,6 +48,14 @@ module Rubycog
     private
 
     def run_tool(name, args)
+      # Process.spawn with a chdir into a missing directory kills the whole VM
+      # on this Ruby/Windows build instead of raising, so the check happens in
+      # front of the child process, not in a rescue around it.
+      unless File.directory?(root)
+        return Result.new(tool: name, ok: false, findings: [],
+                          error: "root is not a directory: #{root}")
+      end
+
       output = +''
       error = +''
       status = nil

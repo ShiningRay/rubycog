@@ -32,7 +32,11 @@ class SourcePathTest < Minitest::Test
   end
 
   def test_rejects_symlink_escape
-    File.symlink('/etc/passwd', File.join(@lib, 'link.rb'))
+    begin
+      File.symlink('/etc/passwd', File.join(@lib, 'link.rb'))
+    rescue NotImplementedError, Errno::EACCES, Errno::EPERM
+      skip 'creating symlinks needs Developer Mode or admin rights on Windows'
+    end
 
     assert_raises(ArgumentError) { Rubycog::SourcePath.resolve('lib/rubycog/link.rb', root: @dir) }
   end
@@ -134,3 +138,4 @@ class SourceEditTest < Minitest::Test
     assert_includes result[:syntax], 'Syntax OK'
   end
 end
+

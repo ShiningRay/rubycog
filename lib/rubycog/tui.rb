@@ -811,8 +811,10 @@ module Rubycog
 
     # Wheel movement arrives as KEY_MOUSE followed by one getmouse event. Clicks
     # are outside the mask we ask for, so anything but wheel motion is ignored.
+    # Windows PDCurses builds do not define KEY_MOUSE, so the constant is
+    # checked before it is compared against.
     def mouse_key(key)
-      return false unless key == Curses::KEY_MOUSE
+      return false unless defined?(Curses::KEY_MOUSE) && key == Curses::KEY_MOUSE
 
       event = Curses.getmouse
       delta = wheel_delta(event.bstate) if event
